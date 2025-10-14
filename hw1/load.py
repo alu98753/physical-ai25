@@ -53,7 +53,9 @@ def make_simple_cfg(settings):
     sim_cfg.scene_id = settings["scene"]
     # agent
     agent_cfg = habitat_sim.agent.AgentConfiguration()
-
+    agent_cfg.action_space["move_backward"] = habitat_sim.agent.ActionSpec(
+        "move_forward", habitat_sim.agent.ActuationSpec(amount=-0.25)
+    )
     # In the 1st example, we attach only one sensor,
     # a RGB visual sensor, to the agent
     rgb_sensor_spec = habitat_sim.CameraSensorSpec()
@@ -131,6 +133,7 @@ sim = habitat_sim.Simulator(cfg)
 # initialize an agent
 agent = sim.initialize_agent(sim_settings["default_agent"])
 
+
 # Set agent state
 agent_state = habitat_sim.AgentState()
 if args.floor == 1:
@@ -146,12 +149,14 @@ print("Discrete action space: ", action_names)
 
 
 FORWARD_KEY="w"
+BACKWARD_KEY="s"
 LEFT_KEY="a"
 RIGHT_KEY="d"
 FINISH="f"
 print("#############################")
 print("use keyboard to control the agent")
 print(" w for go forward  ")
+print(" s for go backward  ")
 print(" a for turn left  ")
 print(" d for trun right  ")
 print(" f for finish and quit the program")
@@ -190,6 +195,11 @@ while True:
     elif keystroke == ord(FINISH):
         print("action: FINISH")
         break
+    elif keystroke == ord(BACKWARD_KEY):
+        action = "move_backward"
+        navigateAndSee(action, data_root)
+        print("action: BACKWARD")
+
     else:
         print("INVALID KEY")
         continue

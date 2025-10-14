@@ -44,9 +44,14 @@ def make_simple_cfg(settings):
     # simulator backend
     sim_cfg = habitat_sim.SimulatorConfiguration()
     sim_cfg.scene_id = settings["scene"]
+    sim_cfg.gpu_device_id = 0
+
     # agent
     agent_cfg = habitat_sim.agent.AgentConfiguration()
-
+    
+    agent_cfg.action_space["move_backward"] = habitat_sim.agent.ActionSpec(
+        "move_forward", habitat_sim.agent.ActuationSpec(amount=-0.25)  # -0.25 表示向後走 0.25m
+    )
     # In the 1st example, we attach only one sensor,
     # a RGB visual sensor, to the agent
     rgb_sensor_spec = habitat_sim.CameraSensorSpec()
@@ -99,6 +104,7 @@ sim = habitat_sim.Simulator(cfg)
 # initialize an agent
 agent = sim.initialize_agent(sim_settings["default_agent"])
 
+
 # Set agent state
 agent_state = habitat_sim.AgentState()
 agent_state.position = np.array([0.0, 0.0, 0.0])  # agent in world space
@@ -113,12 +119,14 @@ print("Discrete action space: ", action_names)
 FORWARD_KEY="w"
 LEFT_KEY="a"
 RIGHT_KEY="d"
+BACKWARD_KEY="s"
 FINISH="f"
 print("#############################")
 print("use keyboard to control the agent")
 print(" w for go forward  ")
 print(" a for turn left  ")
 print(" d for trun right  ")
+# print(" s for go backward  ")
 print(" f for finish and quit the program")
 print("#############################")
 
@@ -154,6 +162,10 @@ while True:
         action = "turn_right"
         navigateAndSee(action)
         print("action: RIGHT")
+    elif keystroke == ord(BACKWARD_KEY):
+        action = "move_backward"
+        navigateAndSee(action)
+        print("action: BACKWARD")
     elif keystroke == ord(FINISH):
         print("action: FINISH")
         break

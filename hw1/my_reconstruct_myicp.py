@@ -5,9 +5,6 @@ import math
 import os
 import cv2
 from scipy.spatial import KDTree
-from scipy.spatial.transform import Rotation as R
-import glob
-import time
 def depth_image_to_point_cloud(rgb, depth, fov_deg: float = 90.0, depth_scale: float = 100.0,
                                depth_trunc_m: float = 6.0):
     H, W = depth.shape
@@ -57,6 +54,7 @@ def preprocess_point_cloud(pcd: o3d.geometry.PointCloud, voxel_size: float):
     # 1) 體素降採樣
     pcd_down = pcd.voxel_down_sample(voxel_size=voxel_size)
 
+    # 2) 估計法向量（對 ICP 的點到面/特徵描述子更友善）
     # 半徑設為 ~ 2 個體素，鄰居數做上限
     radius_normal = voxel_size * 2.0
     pcd_down.estimate_normals(
@@ -109,132 +107,6 @@ def execute_global_registration(source_down, target_down, source_fpfh, target_fp
     print("[INFO] RANSAC Done. Inlier RMSE:", result.inlier_rmse)
     return result
 
-
-def compute_transformation_pt2plane_matrix(source_pts: np.ndarray, target_pts: np.ndarray, target_normals: np.ndarray):
-    """
-    【加速版 Pt2Plane 求解】使用矩陣化運算代替迴圈。
-    
-    Args:
-        source_pts (np.ndarray): 已變換到當前迭代的來源點 (N, 3)。
-        target_pts (np.ndarray): 目標匹配點 (N, 3)。
-        target_normals (np.ndarray): 目標點的法向量 (N, 3)。
-        
-    Returns:
-        tuple: (delta_T (4x4), rmse (float), fitness (float))
-    """
-    N = source_pts.shape[0]
-    if N < 6:
-        return np.eye(4), 9999.0, 0.0
-
-    errors = np.sum((source_pts - target_pts) * target_normals, axis=1) # (N,)
-
-    # === 2. 計算雅可比矩陣 J (N x 6) ===
-    J_rot = np.cross(source_pts, target_normals) # (N, 3)
-    
-    J_trans = target_normals # (N, 3)
-    
-    # c. 組合 J (N x 6)
-    J = np.hstack([J_rot, J_trans]) 
-    
-    A = J.T @ J # 矩陣乘法，高速計算 
-    
-    b_vec = J.T @ errors 
-
-    try:
-        x = np.linalg.solve(A, -b_vec) 
-    except np.linalg.LinAlgError:
-        return np.eye(4), 9999.0, 0.0
-
-    R_delta = R.from_rotvec(x[0:3]).as_matrix()
-    t_delta = x[3:6]
-    
-    delta_T = np.eye(4)
-    delta_T[:3, :3] = R_delta
-    delta_T[:3, 3] = t_delta
-
-    total_sq_error = np.sum(errors**2)
-    rmse = np.sqrt(total_sq_error / N)
-    
-    fitness = N / source_pts.shape[0] 
-    return delta_T, rmse, fitness
-
-def my_local_icp_algorithm_accelerated(source_down, target_down, trans_init, voxel_size_icp, mean_depth=None):
-    t_start = time.time()
-    source_pts_init = get_points(source_down)
-    target_pts = get_points(target_down)
-    N_s_total = source_pts_init.shape[0]
-    # === 0️⃣ 快取機制 (KDTree & 法向量) ===
-    key_tgt = id(target_down)
-    
-    # KDTree 構建 (O(N_t log N_t) 一次性開銷)
-    if key_tgt not in KD_TREE_CACHE:
-        print(f"[INFO] Building KDTree for target cloud (N={target_pts.shape[0]})...")
-        KD_TREE_CACHE[key_tgt] = KDTree(target_pts)
-    target_kdtree = KD_TREE_CACHE[key_tgt]
-    
-    # 法向量估計 (O(N_t * N_k log N_t) 一次性開銷)
-    if key_tgt not in NORMAL_CACHE:
-        t_normals = time.time()
-        print(f"[INFO] Estimating Normals for target cloud (N={target_pts.shape[0]})...")
-        NORMAL_CACHE[key_tgt] = estimate_normals_pca(target_pts, k=30)
-        print(f"[INFO] Normals computation time: {time.time() - t_normals:.2f} s")
-    target_normals = NORMAL_CACHE[key_tgt]
-    
-    # === 1️⃣ Adaptive threshold ===
-    # 根據經驗，設置一個合理的初始距離
-    threshold_icp = voxel_size_icp * 5.0 
-    print(f"[INFO] Running Custom Accelerated Pt2Plane ICP. threshold = {threshold_icp:.4f}")
-
-    # === 2️⃣ 單尺度 ICP (加速且魯棒的 Pt2Plane 通常不需要多尺度) ===
-    max_iter = 15 # 適當的迭代次數
-    tolerance_rot = 1e-6
-    tolerance_trans = 1e-6
-
-    current_trans = trans_init
-    
-    for iteration in range(max_iter):
-        t_iter = time.time()
-        # 1. 變換源點雲 (O(N_s))
-        source_pts_curr = (current_trans[:3, :3] @ source_pts_init.T).T + current_trans[:3, 3]
-        
-        # 2. KDTree 查詢 (O(N_s log N_t)) <--- 每次迭代最耗時部分
-        matched_s, matched_t, matched_normals, valid_mask = find_closest_points_cached(
-            source_pts_curr, target_pts, target_normals, target_kdtree, threshold_icp
-        )
-        t_kdtree = time.time() - t_iter
-        
-        N_matched = matched_s.shape[0]
-        if N_matched < 6:
-            print(f"   ├─ Iter {iteration:2d}: insufficient matches ({N_matched}). KDTime={t_kdtree:.4f}s")
-            break
-
-        # 3. Pt2Plane 矩陣化求解 (O(N_corr) + O(6^3)) <--- 優化加速點
-        t_solve_start = time.time()
-        delta_T, rmse, _ = compute_transformation_pt2plane_matrix(
-            matched_s, matched_t, matched_normals
-        )
-        t_solve = time.time() - t_solve_start
-        
-        # 4. 更新整體變換 (O(1))
-        current_trans = delta_T @ current_trans
-        
-        # 5. 檢查收斂 (O(1))
-        rot_vec = R.from_matrix(delta_T[:3, :3]).as_rotvec()
-        
-        # 修正後的 Fitness
-        fitness = N_matched / N_s_total # 匹配點數 / 總源點數
-        
-        print(f"   ├─ Iter {iteration:2d}: RMSE={rmse:.6f}, fit={fitness:.4f}, KDT: {t_kdtree:.4f}s, SOL: {t_solve:.4f}s")
-        
-        if (np.linalg.norm(delta_T[:3, 3]) < tolerance_trans) and (np.linalg.norm(rot_vec) < tolerance_rot):
-            print("   ├─ Converged.")
-            break
-
-    # 儲存結果
-    final_result = ICPResult(current_trans, rmse, fitness)
-
-    print(f"[INFO] Final Custom Accelerated Pt2Plane ICP → Fitness {final_result.fitness:.4f}, RMSE {final_result.inlier_rmse:.4f}, time={time.time()-t_start:.2f}s")
-    return final_result.transformation
 
 # def local_icp_algorithm(source_down, target_down, trans_init, threshold):
 #     """
@@ -334,7 +206,8 @@ def local_icp_algorithm(source_down, target_down, trans_init, voxel_size_fine, m
     ✅ 限制 ICP 迭代次數 (10~15)
     ✅ 平衡速度與穩定性（加速約 35~45%）
     """
-
+    import open3d as o3d
+    import time
     t_start = time.time()
 
     # === 1️⃣ Adaptive threshold ===
@@ -435,8 +308,11 @@ def local_icp_algorithm(source_down, target_down, trans_init, voxel_size_fine, m
     return final_result.transformation
 
 
+import numpy as np
+import time
+
 # =========================================================================
-# 輔助函式 
+# 輔助函式 (必須用純 NumPy/Scipy 替代 Open3D 的內部實現)
 # =========================================================================
 
 def get_points(pcd_o3d):
@@ -523,6 +399,14 @@ def compute_transformation_pt2plane(source_pts: np.ndarray, target_pts: np.ndarr
 
     return delta_T, rmse, fitness
 
+# 引入必要的庫
+import numpy as np
+from scipy.spatial import KDTree
+from scipy.spatial.transform import Rotation as R
+import time
+
+# ... (保留您原本的 get_points 和 ICPResult 函式/類別)
+
 def estimate_normals_pca(pts: np.ndarray, k: int = 30):
     """
     【代替 Open3D 的 estimate_normals】
@@ -555,16 +439,25 @@ def estimate_normals_pca(pts: np.ndarray, k: int = 30):
         neighbor_indices = indices[i]
         neighbors = pts[neighbor_indices]
         
+        # 1. 計算質心 (Centroid)
         centroid = np.mean(neighbors, axis=0)
         
+        # 2. 去中心化 (Centering)
         centered_neighbors = neighbors - centroid
         
+        # 3. 計算協方差矩陣 (Covariance Matrix)
+        # H = X^T X, where X is centered_neighbors
         H = centered_neighbors.T @ centered_neighbors
         
+        # 4. SVD 或特徵分解
+        # 法向量是最小特徵值對應的特徵向量 (np.linalg.eigh 效率更高)
         eigen_values, eigen_vectors = np.linalg.eigh(H)
         
+        # 最小特徵值對應的特徵向量是法向量
         normal = eigen_vectors[:, np.argmin(eigen_values)]
         
+        # 5. 法向量方向一致化 (簡單版：假設都朝向原點)
+        # Open3D 內部有更好的方法，這裡用簡單的 heuristics
         if np.dot(normal, pts[i]) > 0:
              normal = -normal
              
@@ -835,6 +728,12 @@ def my_local_icp_algorithm(source_down, target_down, trans_init, voxel_size_icp,
     return final_result.transformation
 
 
+import os
+import cv2
+import glob
+import numpy as np
+import open3d as o3d
+import time
 
 def reconstruct(args):
     """
@@ -966,9 +865,7 @@ def reconstruct(args):
         elif args.version == 'my_icp':
             # 使用您自己實作的純 NumPy ICP
             print("[INFO] Calling Custom my_local_icp_algorithm (Pure NumPy Pt2Pt)")
-            # result_icp = my_local_icp_algorithm(source_down_icp, target_down_icp, trans_init, voxel_size_icp)
-            result_icp = my_local_icp_algorithm_accelerated(source_down_icp, target_down_icp, trans_init, voxel_size_icp)
-
+            result_icp = my_local_icp_algorithm(source_down_icp, target_down_icp, trans_init, voxel_size_icp)
         else:
             raise ValueError(f"Unknown ICP version: {args.version}. Must be 'open3d' or 'my_icp'.")
         
@@ -1103,7 +1000,7 @@ if __name__ == '__main__':
     
     print("\n[INFO] Visualizing result... Close the window to exit.")
 
-    # === ：輸出結果 ===
+    # === 新增：輸出結果 ===
     save_name = f"reconstruction_F{args.floor}_{args.version}.ply"
     o3d.io.write_point_cloud(save_name, result_pcd)
     print(f"[SAVE] Reconstructed point cloud saved to: {save_name}")

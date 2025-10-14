@@ -1,0 +1,9 @@
+data_collection/
+
+*ply
+*json
+*.png
+*.jpg
+*.npz
+*.npy
+*.mp4
