@@ -7,3 +7,5 @@ data_collection/
 *.npz
 *.npy
 *.mp4
+
+__pyc*/

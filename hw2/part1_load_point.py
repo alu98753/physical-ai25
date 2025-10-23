@@ -42,6 +42,18 @@ o3d.visualization.draw_geometries([pcd_filtered])
 x_coords = filtered_points[:, 0]
 z_coords = filtered_points[:, 2]
 
+
+import json
+data = {
+    "xmin": x_coords.min(),
+    "xmax": x_coords.max(),
+    "zmin": z_coords.min(),
+    "zmax": z_coords.max()
+}
+OUTPUT_FILENAME = "coordinate_bounds.json"
+with open(OUTPUT_FILENAME,'w',encoding='utf-8') as f:
+    json.dump(data, f, indent=4)
+
 # 步驟 3: 繪製散點圖
 # 為了讓地圖看起來更像俯視圖，你可以將 Z 座標視為 Y 座標。
 
