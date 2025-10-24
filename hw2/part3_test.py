@@ -11,14 +11,6 @@ import matplotlib.pyplot as plt
 # ==========================================================
 # Habitat 環境封裝
 # ==========================================================
-
-# ==========================================================
-# 動作生成（安全版本）
-# ==========================================================
-FORWARD_STEP = 0.033
-TURN_ANGLE = 1.33
-ARRIVAL_THRESH = 0.15
-MAX_ACTIONS = 5000
 class HabitatEnvWrapper:
     def __init__(self, sim_settings, floor=1):
         self.cfg = self.make_simple_cfg(sim_settings)
@@ -38,16 +30,15 @@ class HabitatEnvWrapper:
         agent_cfg = habitat_sim.agent.AgentConfiguration()
         agent_cfg.action_space = {
             "move_forward": habitat_sim.agent.ActionSpec(
-                "move_forward", habitat_sim.agent.ActuationSpec(amount=FORWARD_STEP)
+                "move_forward", habitat_sim.agent.ActuationSpec(amount=0.01)
             ),
             "turn_left": habitat_sim.agent.ActionSpec(
-                "turn_left", habitat_sim.agent.ActuationSpec(amount=TURN_ANGLE)
+                "turn_left", habitat_sim.agent.ActuationSpec(amount=2.0)
             ),
             "turn_right": habitat_sim.agent.ActionSpec(
-                "turn_right", habitat_sim.agent.ActuationSpec(amount=TURN_ANGLE)
+                "turn_right", habitat_sim.agent.ActuationSpec(amount=2.0)
             ),
         }
-
 
 
         def make_sensor(uuid, stype):
@@ -88,52 +79,32 @@ def load_bounds(json_path):
         data = json.load(f)
     return data["xmin"], data["xmax"], data["zmin"], data["zmax"]
 
-def distance_to_path(current_pos, path):
-    """回傳 agent 到當前路徑上最近點的距離"""
-    if not path:
-        return np.inf
-    pxz = np.array([[px, pz] for px, pz in path])
-    pos_xz = np.array([current_pos[0], current_pos[2]])
-    dists = np.linalg.norm(pxz - pos_xz, axis=1)
-    return np.min(dists)
-
 def pixel_to_world(u, v, w, h, bounds):
-    SCALE_FACTOR = 10000 / 255  # 
-    # 假設 bounds 是點雲的 min/max (例如 20, 230, 15, 240)
-    xmin_pt, xmax_pt, zmin_pt, zmax_pt = bounds 
+    SCALE_FACTOR = 10000 / 255  # 固定比例
+    xmin, xmax, zmin, zmax = bounds
 
-    # 步驟 1: Pixel (u, v) 轉換到 Point Cloud 座標 (x_pt, z_pt)
-    # (標準線性內插)
-    x_pt = xmin_pt + (u / w) * (xmax_pt - xmin_pt)
-    
-    # (1.0 - v/h) 是因為 pixel 的 v 軸 (向下) 和 Habitat 的 z 軸 (通常向上或向前) 是反的
-    z_pt = zmin_pt + (1.0 - (v / h)) * (zmax_pt - zmin_pt)
+    # 步驟 1：將 pixel 正規化到 [0, 255]
+    u_norm = (u / w) * 255
+    v_norm = (v / h) * 255
 
-    # 步驟 2: Point Cloud 座標 (x_pt, z_pt) 轉換到 Habitat 世界座標
-    # 根據 spec  套用縮放
-    x_world = x_pt * SCALE_FACTOR
-    z_world = z_pt * SCALE_FACTOR
+    # 步驟 2：線性縮放到 Habitat 實際世界座標
+    x = u_norm * SCALE_FACTOR / 10000 * (xmax - xmin)
+    z = (255 - v_norm) * SCALE_FACTOR / 10000 * (zmax - zmin)
 
-    return float(x_world), float(z_world)
+    # 步驟 3：平移到正確範圍
+    x = xmin + x
+    z = zmin + z
 
-def world_to_pixel(x, z, w, h, bounds):
-    SCALE_FACTOR = 10000 / 255  # 
-    xmin_pt, xmax_pt, zmin_pt, zmax_pt = bounds
+    return float(x), float(z)
 
-    # 步驟 1: World 座標 -> Point Cloud 座標
-    x_pt = x / SCALE_FACTOR
-    z_pt = z / SCALE_FACTOR
-    
-    # 步驟 2: Point Cloud 座標 -> Pixel 座標 (u, v)
-    # (反向線性內插)
-    u_ratio = (x_pt - xmin_pt) / (xmax_pt - xmin_pt)
-    v_ratio = 1.0 - (z_pt - zmin_pt) / (zmax_pt - zmin_pt) # 反轉 v 軸
 
-    u = u_ratio * w
-    v = v_ratio * h
-
-    return int(round(u)), int(round(v))
-
+# ==========================================================
+# 動作生成（安全版本）
+# ==========================================================
+FORWARD_STEP = 0.25
+TURN_ANGLE = 10.0
+ARRIVAL_THRESH = 0.15
+MAX_ACTIONS = 5000
 
 def wrap_to_pi(a): return (a + math.pi) % (2 * math.pi) - math.pi
 
@@ -157,7 +128,7 @@ def generate_actions_from_world_path(world_path_xz,
                 actions.append("turn_right")
                 yaw -= step
         # 不要無限迴圈，避免震盪
-        # print(f"[turn] desired={math.degrees(desired_yaw):.1f}, curr={math.degrees(yaw):.1f}, diff={math.degrees(d):.1f}")
+        print(f"[turn] desired={math.degrees(desired_yaw):.1f}, curr={math.degrees(yaw):.1f}, diff={math.degrees(d):.1f}")
 
 
     def forward_to(tx, tz):
@@ -172,7 +143,7 @@ def generate_actions_from_world_path(world_path_xz,
         n = min(n, 50)  # 安全上限
         actions.extend(["move_forward"] * n)
         sim_x, sim_z = tx, tz
-        # print(f"[move] from ({sim_x:.2f},{sim_z:.2f}) → ({tx:.2f},{tz:.2f}), dist={dist:.2f}, yaw={math.degrees(desired_yaw):.1f}")
+        print(f"[move] from ({sim_x:.2f},{sim_z:.2f}) → ({tx:.2f},{tz:.2f}), dist={dist:.2f}, yaw={math.degrees(desired_yaw):.1f}")
 
     for k in range(1, len(world_path_xz)):
         tx, tz = world_path_xz[k]
@@ -180,7 +151,7 @@ def generate_actions_from_world_path(world_path_xz,
         dist = math.hypot(dx, dz)
         desired_yaw = math.atan2(dx, dz)  # 注意這裡反轉
 
-        # print(f"Segment {k}: dist={dist:.4f}, yaw_diff={math.degrees(wrap_to_pi(desired_yaw - yaw)):.2f}")
+        print(f"Segment {k}: dist={dist:.4f}, yaw_diff={math.degrees(wrap_to_pi(desired_yaw - yaw)):.2f}")
 
 
         turn_to(desired_yaw)
@@ -189,8 +160,7 @@ def generate_actions_from_world_path(world_path_xz,
             print("⚠️ [WARN] Too many actions generated, truncating.")
             break
 
-    # print(f"[INFO] Total generated actions: {len(actions)}")
-    # print(f"[INFO] first 5 actions:{actions[:5]}")
+    print(f"[INFO] Total generated actions: {len(actions)}")
     return actions
 
 # ==========================================================
@@ -206,7 +176,7 @@ def overlay_mask(rgb, mask, color=(255, 0, 0), alpha=0.35):
 
 def run_navigation(env, world_path, target_mask, output_video="result.mp4"):
     actions = generate_actions_from_world_path(world_path)
-    print("actions:",actions)
+
     vw = cv2.VideoWriter(output_video, cv2.VideoWriter_fourcc(*"mp4v"), 120, (512, 512))
     frame_count = 0
 
@@ -225,7 +195,7 @@ def run_navigation(env, world_path, target_mask, output_video="result.mp4"):
     #     if idx % 200 == 0:
     #         print(f"[INFO] Progress: {idx}/{len(actions)} actions executed")
     for idx, act in enumerate(actions):
-        for sub in range(60):  # 每個動作輸出3幀
+        for sub in range(3):  # 每個動作輸出3幀
             obs = env.step(act)
             rgb = obs["rgb"]
             mask = target_mask(obs)
@@ -237,13 +207,44 @@ def run_navigation(env, world_path, target_mask, output_video="result.mp4"):
     vw.release()
     print(f"[INFO] Navigation complete, {frame_count} frames saved ✅")
 
+def distance_to_path(current_pos, path):
+    """回傳 agent 到當前路徑上最近點的距離"""
+    if not path:
+        return np.inf
+    pxz = np.array([[px, pz] for px, pz in path])
+    pos_xz = np.array([current_pos[0], current_pos[2]])
+    dists = np.linalg.norm(pxz - pos_xz, axis=1)
+    return np.min(dists)
+
+def world_to_pixel(x, z, w, h, bounds):
+    """
+    將 Habitat 世界座標 (x, z) 反轉換回像素座標 (u, v)，
+    與 pixel_to_world() 完全對應。
+    """
+    SCALE_FACTOR = 10000 / 255
+    xmin, xmax, zmin, zmax = bounds
+
+    # Step 1: 還原到正規化空間 [0, 255]
+    x_ratio = (x - xmin) / (xmax - xmin)
+    z_ratio = (z - zmin) / (zmax - zmin)
+
+    u_norm = x_ratio * 10000 / SCALE_FACTOR
+    v_norm = 255 - (z_ratio * 10000 / SCALE_FACTOR)
+
+    # Step 2: 還原到像素座標空間 [0, w] × [0, h]
+    u = (u_norm / 255) * w
+    v = (v_norm / 255) * h
+
+    # Step 3: 四捨五入成整數像素位置
+    return int(round(u)), int(round(v))
+
 
 def run_navigation_replan(env, binary_map, color_map, bounds, start, goal, target_mask,
                           output_video="result_replan.mp4", replan_thresh=0.3):
     """
     主導航流程：包含 stuck / deviation / goal 三種事件觸發
     """
-    vw = cv2.VideoWriter(output_video, cv2.VideoWriter_fourcc(*"mp4v"), 120, (512, 512))
+    vw = cv2.VideoWriter(output_video, cv2.VideoWriter_fourcc(*"mp4v"), 60, (512, 512))
     stuck_counter = 0
     frame_count = 0
 
@@ -256,32 +257,18 @@ def run_navigation_replan(env, binary_map, color_map, bounds, start, goal, targe
     world_path = [pixel_to_world(u, v, w, h, bounds) for (u, v) in path_pixel]
     actions = generate_actions_from_world_path(world_path)
     print(f"[INIT] RRT 路徑生成完成，共 {len(world_path)} 點")
-    print("[DEBUG] First world_path point:", world_path[0])
-    print("[DEBUG] Last world_path point:", world_path[-1])
-    print("[DEBUG] Typical segment dist:", np.mean(
-        [math.hypot(world_path[i+1][0]-world_path[i][0],
-                    world_path[i+1][1]-world_path[i][1])
-        for i in range(len(world_path)-1)]))
-    count = 0
 
     while True:
-        count +=1
-        print(f"count:{count}")
         for act in actions:
-            for sub in range(24):  # 每個動作輸出3幀
-                obs = env.step(act)
-                pos = env.agent.get_state().position.copy()
-                dist_to_goal = np.linalg.norm(pos[[0, 2]] - np.array(world_path[-1]))
-                dist_to_path = distance_to_path(pos, world_path)
-            print(f"[DEBUG] pos=({pos[0]:.2f},{pos[2]:.2f}), "
-                f"goal=({world_path[-1][0]:.2f},{world_path[-1][1]:.2f}), "
-                f"dist_to_goal={dist_to_goal:.3f}, dist_to_path={dist_to_path:.3f}")
+            obs = env.step(act)
+            pos = env.agent.get_state().position.copy()
+            dist_to_goal = np.linalg.norm(pos[[0, 2]] - np.array(world_path[-1]))
+            dist_to_path = distance_to_path(pos, world_path)
+
             # ======= 三種事件偵測 =======
-            if dist_to_goal < 0.00001:
+            if dist_to_goal < 0.2:
                 print(f"[SUCCESS] Reached goal ✅ ({pos[0]:.2f}, {pos[2]:.2f})")
                 vw.release()
-                print(f"[END] Navigation finished, {frame_count} frames saved.")
-
                 return
 
             if dist_to_path > replan_thresh:
@@ -304,8 +291,6 @@ def run_navigation_replan(env, binary_map, color_map, bounds, start, goal, targe
             vis = overlay_mask(rgb, mask)
             vw.write(cv2.cvtColor(vis, cv2.COLOR_RGB2BGR))
             frame_count += 1
-            if frame_count % 10 == 0:
-                print(f"[DEBUG] 已寫入 {frame_count} 幀到影片")
 
             current_pos = pos.copy()
         else:
@@ -318,19 +303,11 @@ def run_navigation_replan(env, binary_map, color_map, bounds, start, goal, targe
 
         start_pixel = world_to_pixel(current_pos[0], current_pos[2], w, h, bounds)
         path_pixel, _ = rrt_planning(binary_map, start_pixel, goal)
-        counter = 0
         while path_pixel is None:
             print(f"❌ [REPLAN FAIL] 無法找到可行路徑， again。{start_pixel}")
             path_pixel, _ = rrt_planning(binary_map, start_pixel, goal)
-            counter +=1
-            if path_pixel or counter >=10:
+            if path_pixel:
                 break
-        if counter >=10 or frame_count>300 or count>300:
-            print(f"[Fail] not Reached goal but fail to find path ({pos[0]:.2f}, {pos[2]:.2f})")
-            vw.release()
-            print(f"[END] Navigation finished, {frame_count} frames saved.")
-            return
-        
         world_path = [pixel_to_world(u, v, w, h, bounds) for (u, v) in path_pixel]
         actions = generate_actions_from_world_path(world_path)
         print(f"[INFO] Replan done: {len(world_path)} points, {len(actions)} actions.")
@@ -406,95 +383,8 @@ if __name__ == "__main__":
     # pixel → world
     bounds = load_bounds(BOUNDS_PATH)
     h, w, _ = cv2.imread(MAP_PATH).shape
-    
-    world_path = [pixel_to_world(u, v, w, h, bounds) for (u, v) in path]
-    # world_path = simplify_path(world_path, min_step=0.1)
-    print(f"[INFO] Simplified path from {len(path)} → {len(world_path)} points")
-    for i in range(5):
-        (x1, z1), (x2, z2) = world_path[i], world_path[i+1]
-        print(f"Segment {i}: dist={math.hypot(x2 - x1, z2 - z1):.3f}")
+    print(w,h)
+    x, z = pixel_to_world(335, 240, w, h, bounds)
+    u, v = world_to_pixel(0.95390034/40, 5.5232677/40 , w, h, bounds)
+    print(f"Round-trip result:{x},{z} ({u}, {v}) ≈ (335, 240)")
 
-    # print("[DEBUG] First few world_path coords:")
-    # for i, p in enumerate(world_path[:5]):
-    #     print(f"  {i}: {p}")
-    # Habitat 環境
-    sim_settings = {
-        "scene": "/home/clu98753cs13/Desktop/course/phyai/physical-ai25/hw0/replica_v1/apartment_0/habitat/mesh_semantic.ply",
-        "default_agent": 0,
-        "sensor_height": 1.5,
-        "width": 512,
-        "height": 512,
-        "sensor_pitch": 0,
-    }
-
-    # # ----------------------------------------------------------
-    # # test: forward 動作是否生效 + 錄影
-    # print("[DEBUG] smoke test: try 10 forward steps and record")
-
-    # vw = cv2.VideoWriter(f"{OUTPUT_PATH}/smoke_forward_test.mp4",
-    #                     cv2.VideoWriter_fourcc(*"mp4v"),
-    #                     5, (512, 512))
-    # last_pos = env.agent.get_state().position.copy()
-
-    # for i in range(10):
-    #     obs = env.step("move_forward")
-    #     pos = env.agent.get_state().position
-    #     moved = np.linalg.norm(pos - last_pos) > 1e-3
-    #     print(f"[smoke] i={i}, moved={moved}, pos={pos}")
-    #     frame = obs["rgb"]
-    #     vw.write(cv2.cvtColor(frame, cv2.COLOR_RGB2BGR))
-    #     last_pos = pos.copy()
-
-    # vw.release()
-    # print("[DEBUG] smoke test video saved as smoke_forward_test.mp4")
-    # # ----------------------------------------------------------
-
-    def target_mask(obs):
-        semantic_img = obs["semantic"]
-        target_rgb = np.array(color_map[TARGET_CLASS.lower()])[::-1]
-        mask = cv2.inRange(semantic_img, target_rgb, target_rgb)
-        return (mask > 0).astype(np.uint8)
-
-    # === 導航 + 輸出 ===
-    env = HabitatEnvWrapper(sim_settings)
-    
-    # TODO: 1.Which code snippet affects my position and angle?
-    
-    # TODO: 2.set init position 
-    start_x, start_z = pixel_to_world(start[0], start[1], w, h, bounds)
-    print(f"[INFO] Start world coord: ({start_x:.3f}, {start_z:.3f})")
-    state = habitat_sim.AgentState()
-    state.position = np.array([start_x, 0, start_z])  # y=高度 =0
-    env.agent.set_state(state)
-    print(f"[INFO] Agent placed at world position: {state.position}")
-
-    # TODO: 3.set rotate
-    # === 設定初始面向 ===
-    dx = world_path[1][0] - world_path[0][0]
-    dz = world_path[1][1] - world_path[0][1]
-    init_yaw = math.atan2(-dx, -dz)  # 注意：dx, dz 的順序
-    quat = np.array([0.0, math.sin(init_yaw / 2.0), 0.0, math.cos(init_yaw / 2.0)], dtype=np.float32)
-
-    state.rotation = quat
-    env.agent.set_state(state)
-
-    print(f"[INFO] Agent initial yaw = {math.degrees(init_yaw):.2f}°")
-    print(f"[INFO] Agent placed at {state.position} with rotation {state.rotation}")
-
-
-    # TODO: 4. generate action and move
-    """
-    I think the robot’s step size and angle have a big impact.
-    Also, for the motion generation part`generate_actions_from_world_path`, 
-    I simplified it — it only searches "once" ,
-    and doesn’t fit the path, so the path got simplified.
-    """
-    
-    video_path = f"{OUTPUT_PATH}/{TARGET_CLASS}_safe_final.mp4"
-    # actions = generate_actions_from_world_path(world_path)
-    run_navigation_replan(env, binary, color_map, bounds, start, goal, target_mask, output_video=video_path)
-
-    # run_navigation(env, world_path, target_mask, output_video=video_path)
-    visualize_path_on_map(MAP_PATH, path, goal, start, TARGET_CLASS, OUTPUT_PATH)
-    env.sim.close()
-    print(f"[✅ DONE] 導航影片與地圖已輸出至 {OUTPUT_PATH}/")
