@@ -15,10 +15,11 @@ import matplotlib.pyplot as plt
 # ==========================================================
 # 動作生成（安全版本）
 # ==========================================================
-FORWARD_STEP = 0.033
-TURN_ANGLE = 1.33
+FORWARD_STEP = 0.05
+TURN_ANGLE = 1
 ARRIVAL_THRESH = 0.15
 MAX_ACTIONS = 5000
+FPS = 120
 class HabitatEnvWrapper:
     def __init__(self, sim_settings, floor=1):
         self.cfg = self.make_simple_cfg(sim_settings)
@@ -138,12 +139,13 @@ def world_to_pixel(x, z, w, h, bounds):
 def wrap_to_pi(a): return (a + math.pi) % (2 * math.pi) - math.pi
 
 def generate_actions_from_world_path(world_path_xz,
+                                    current_yaw_rad = 0.0,
                                     forward_step_m=FORWARD_STEP,
                                     turn_step_deg=TURN_ANGLE,
                                     arrival_thresh_m=ARRIVAL_THRESH):
     actions = []
     sim_x, sim_z = world_path_xz[0]
-    yaw = 0.0
+    yaw = current_yaw_rad
 
     def turn_to(desired_yaw):
         nonlocal yaw
@@ -164,7 +166,7 @@ def generate_actions_from_world_path(world_path_xz,
         nonlocal sim_x, sim_z
         dx, dz = tx - sim_x, tz - sim_z
         dist = math.hypot(dx, dz)
-        print("dist:",dist)
+        # print("dist:",dist)
         if not np.isfinite(dist) or dist > 10:
             print(f"⚠️ [WARN] Invalid dist={dist:.3f}, skipping")
             return
@@ -178,7 +180,7 @@ def generate_actions_from_world_path(world_path_xz,
         tx, tz = world_path_xz[k]
         dx, dz = tx - sim_x, tz - sim_z
         dist = math.hypot(dx, dz)
-        desired_yaw = math.atan2(dx, dz)  # 注意這裡反轉
+        desired_yaw = math.atan2(-dx, -dz)  # 注意這裡反轉
 
         # print(f"Segment {k}: dist={dist:.4f}, yaw_diff={math.degrees(wrap_to_pi(desired_yaw - yaw)):.2f}")
 
@@ -207,7 +209,7 @@ def overlay_mask(rgb, mask, color=(255, 0, 0), alpha=0.35):
 def run_navigation(env, world_path, target_mask, output_video="result.mp4"):
     actions = generate_actions_from_world_path(world_path)
     print("actions:",actions)
-    vw = cv2.VideoWriter(output_video, cv2.VideoWriter_fourcc(*"mp4v"), 120, (512, 512))
+    vw = cv2.VideoWriter(output_video, cv2.VideoWriter_fourcc(*"mp4v"), FPS, (512, 512))
     frame_count = 0
 
     # for idx, act in enumerate(actions):
@@ -225,7 +227,7 @@ def run_navigation(env, world_path, target_mask, output_video="result.mp4"):
     #     if idx % 200 == 0:
     #         print(f"[INFO] Progress: {idx}/{len(actions)} actions executed")
     for idx, act in enumerate(actions):
-        for sub in range(60):  # 每個動作輸出3幀
+        for sub in range(int(1)):  # 每個動作輸出3幀
             obs = env.step(act)
             rgb = obs["rgb"]
             mask = target_mask(obs)
@@ -238,12 +240,12 @@ def run_navigation(env, world_path, target_mask, output_video="result.mp4"):
     print(f"[INFO] Navigation complete, {frame_count} frames saved ✅")
 
 
-def run_navigation_replan(env, binary_map, color_map, bounds, start, goal, target_mask,
-                          output_video="result_replan.mp4", replan_thresh=0.3):
+def run_navigation_replan(env, binary_map,safe_binary_map, color_map, bounds, start, goal, target_mask,
+                        output_video="result_replan.mp4", replan_thresh=0.3):
     """
     主導航流程：包含 stuck / deviation / goal 三種事件觸發
     """
-    vw = cv2.VideoWriter(output_video, cv2.VideoWriter_fourcc(*"mp4v"), 120, (512, 512))
+    vw = cv2.VideoWriter(output_video, cv2.VideoWriter_fourcc(*"mp4v"), FPS, (512, 512))
     stuck_counter = 0
     frame_count = 0
 
@@ -252,9 +254,15 @@ def run_navigation_replan(env, binary_map, color_map, bounds, start, goal, targe
     current_pos = current_state.position.copy()
 
     # === 初始路徑規劃 ===
-    path_pixel, _ = rrt_planning(binary_map, start, goal)
+    path_pixel, _ = rrt_planning(safe_binary_map, start, goal)
     world_path = [pixel_to_world(u, v, w, h, bounds) for (u, v) in path_pixel]
-    actions = generate_actions_from_world_path(world_path)
+    # actions = generate_actions_from_world_path(world_path)
+    
+    # 從 current_state 獲取初始 yaw
+    q = current_state.rotation
+    init_yaw = 2 * math.atan2(q.imag[1], q.real) # 從四元數提取 Y 軸旋轉
+    
+    actions = generate_actions_from_world_path(world_path, current_yaw_rad=init_yaw)
     print(f"[INIT] RRT 路徑生成完成，共 {len(world_path)} 點")
     print("[DEBUG] First world_path point:", world_path[0])
     print("[DEBUG] Last world_path point:", world_path[-1])
@@ -266,13 +274,12 @@ def run_navigation_replan(env, binary_map, color_map, bounds, start, goal, targe
 
     while True:
         count +=1
-        print(f"count:{count}")
+        print(f"replan count:{count}")
         for act in actions:
-            for sub in range(24):  # 每個動作輸出3幀
-                obs = env.step(act)
-                pos = env.agent.get_state().position.copy()
-                dist_to_goal = np.linalg.norm(pos[[0, 2]] - np.array(world_path[-1]))
-                dist_to_path = distance_to_path(pos, world_path)
+            obs = env.step(act)
+            pos = env.agent.get_state().position.copy()
+            dist_to_goal = np.linalg.norm(pos[[0, 2]] - np.array(world_path[-1]))
+            dist_to_path = distance_to_path(pos, world_path)
             print(f"[DEBUG] pos=({pos[0]:.2f},{pos[2]:.2f}), "
                 f"goal=({world_path[-1][0]:.2f},{world_path[-1][1]:.2f}), "
                 f"dist_to_goal={dist_to_goal:.3f}, dist_to_path={dist_to_path:.3f}")
@@ -283,57 +290,66 @@ def run_navigation_replan(env, binary_map, color_map, bounds, start, goal, targe
                 print(f"[END] Navigation finished, {frame_count} frames saved.")
 
                 return
+            move_dist = np.linalg.norm(pos - current_pos)
 
             if dist_to_path > replan_thresh:
-                print(f"[REPLAN] Deviated from path ({dist_to_path:.2f} m) → 重新規劃")
+                # print(f"[REPLAN] Deviated from path ({dist_to_path:.2f} m) → 重新規劃")
+                current_pos = pos.copy()
                 break  # 退出內層 loop，重新規劃
 
-            move_dist = np.linalg.norm(pos - current_pos)
             if move_dist < 0.01:
                 stuck_counter += 1
             else:
                 stuck_counter = 0
 
             if stuck_counter > 20:
-                print("[REPLAN] Agent stuck → 重新規劃")
+                # print("[REPLAN] Agent stuck → 重新規劃")
+                current_pos = pos.copy()
                 break  # 跳出重新規劃
-
+            current_pos = pos.copy()
             # === 繪製畫面 ===
             rgb = obs["rgb"]
             mask = target_mask(obs)
             vis = overlay_mask(rgb, mask)
-            vw.write(cv2.cvtColor(vis, cv2.COLOR_RGB2BGR))
-            frame_count += 1
+            for sub in range(FPS//15):  # 每個動作輸出3幀
+                vw.write(cv2.cvtColor(vis, cv2.COLOR_RGB2BGR))
+                frame_count += 1
             if frame_count % 10 == 0:
                 print(f"[DEBUG] 已寫入 {frame_count} 幀到影片")
 
-            current_pos = pos.copy()
+            # current_pos = pos.copy()
         else:
             # 如果沒 break（未重規劃）則繼續
             continue
 
         # ======= 重新規劃 =======
-        print(current_pos[0], current_pos[2], bounds, w, h)
-        print("[DEBUG] bounds =", bounds)
+        # print(current_pos[0], current_pos[2], bounds, w, h)
+        # print("[DEBUG] bounds =", bounds)
 
         start_pixel = world_to_pixel(current_pos[0], current_pos[2], w, h, bounds)
-        path_pixel, _ = rrt_planning(binary_map, start_pixel, goal)
+        path_pixel, _ = rrt_planning(safe_binary_map, start_pixel, goal)
         counter = 0
         while path_pixel is None:
             print(f"❌ [REPLAN FAIL] 無法找到可行路徑， again。{start_pixel}")
-            path_pixel, _ = rrt_planning(binary_map, start_pixel, goal)
+            path_pixel, _ = rrt_planning(safe_binary_map, start_pixel, goal)
             counter +=1
             if path_pixel or counter >=10:
                 break
-        if counter >=10 or frame_count>300 or count>300:
+        if counter >=10  or count>50 : # or count>20
+            print(f"[Fail] counter:{counter},frame count:{frame_count},count:{count}")
             print(f"[Fail] not Reached goal but fail to find path ({pos[0]:.2f}, {pos[2]:.2f})")
             vw.release()
             print(f"[END] Navigation finished, {frame_count} frames saved.")
             return
         
         world_path = [pixel_to_world(u, v, w, h, bounds) for (u, v) in path_pixel]
-        actions = generate_actions_from_world_path(world_path)
-        print(f"[INFO] Replan done: {len(world_path)} points, {len(actions)} actions.")
+        # actions = generate_actions_from_world_path(world_path)
+        q_replan = current_state.rotation
+        replan_yaw = 2 * math.atan2(q_replan.imag[1], q_replan.real)
+        
+        actions = generate_actions_from_world_path(world_path, current_yaw_rad=replan_yaw)
+        counter = 0
+        # print(f"[INFO] Replan done: {len(world_path)} points, {len(actions)} actions.")
 
     vw.release()
     print(f"[END] Navigation finished, {frame_count} frames saved.")
@@ -398,7 +414,22 @@ if __name__ == "__main__":
 
     map_gray = cv2.imread(MAP_PATH, cv2.IMREAD_GRAYSCALE)
     _, binary = cv2.threshold(map_gray, 240, 255, cv2.THRESH_BINARY)
-    path, _ = rrt_planning(binary, start, goal)
+# === 解決方案：侵蝕可行走區域 (建立安全緩衝區) ===
+    print("[INFO] 正在侵蝕可行走區域以建立安全緩衝區...")
+    
+    # 決定緩衝區的大小 (kernel 越大，緩衝區越寬，路徑越保守)
+    # 5x5 或 7x7 通常是個好的開始
+    kernel_size = 15 
+    kernel = np.ones((kernel_size, kernel_size), np.uint8)
+    
+    # 'binary' 中可行走區域是 255 (白色)，障礙物是 0 (黑色)
+    # 'erode' (侵蝕) 會縮小白**色區域，使其遠離黑色邊界
+    # 這等同於讓障礙物 (牆壁) "膨脹" 了 (kernel_size / 2) 個像素
+    safe_binary_map = cv2.erode(binary, kernel, iterations=1)
+    
+    print("[INFO] 安全緩衝區建立完畢。")
+    # === 解決方案結束 ===
+    path, _ = rrt_planning(safe_binary_map, start, goal)
     if path is None:
         print("❌ 無法找到可行路徑。")
         exit()
@@ -408,7 +439,8 @@ if __name__ == "__main__":
     h, w, _ = cv2.imread(MAP_PATH).shape
     
     world_path = [pixel_to_world(u, v, w, h, bounds) for (u, v) in path]
-    # world_path = simplify_path(world_path, min_step=0.1)
+    # world_path = [(x * 40, z * 40) for (x, z) in world_path]  # 保留縮放
+    world_path = simplify_path(world_path, min_step=0.25)
     print(f"[INFO] Simplified path from {len(path)} → {len(world_path)} points")
     for i in range(5):
         (x1, z1), (x2, z2) = world_path[i], world_path[i+1]
@@ -462,6 +494,7 @@ if __name__ == "__main__":
     
     # TODO: 2.set init position 
     start_x, start_z = pixel_to_world(start[0], start[1], w, h, bounds)
+    # start_x, start_z = start_x * 40, start_z * 40   # 若你有 global scaling
     print(f"[INFO] Start world coord: ({start_x:.3f}, {start_z:.3f})")
     state = habitat_sim.AgentState()
     state.position = np.array([start_x, 0, start_z])  # y=高度 =0
@@ -491,8 +524,7 @@ if __name__ == "__main__":
     """
     
     video_path = f"{OUTPUT_PATH}/{TARGET_CLASS}_safe_final.mp4"
-    # actions = generate_actions_from_world_path(world_path)
-    run_navigation_replan(env, binary, color_map, bounds, start, goal, target_mask, output_video=video_path)
+    run_navigation_replan(env, binary, safe_binary_map, color_map, bounds, start, goal, target_mask, output_video=video_path)
 
     # run_navigation(env, world_path, target_mask, output_video=video_path)
     visualize_path_on_map(MAP_PATH, path, goal, start, TARGET_CLASS, OUTPUT_PATH)

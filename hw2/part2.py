@@ -172,7 +172,7 @@ def rrt_planning(map_img, start, goal):
 
         # 是否接近目標
         if distance((new_node.x, new_node.y), goal) < STEP_SIZE:
-            print(f"[SUCCESS] 第 {i} 次迭代到達目標。")
+            # print(f"[SUCCESS] 第 {i} 次迭代到達目標。")
             final_node = Node(goal[0], goal[1], new_node)
             path = extract_path(final_node)
             return path, nodes
