@@ -4,7 +4,7 @@ import pandas as pd
 import matplotlib.pyplot as plt
 import random
 import math
-from collections import namedtuple
+from collections import deque
 
 # ==========================================================
 # 路徑設定
@@ -12,137 +12,316 @@ from collections import namedtuple
 MAP_PATH = "/home/clu98753cs13/Desktop/course/phyai/physical-ai25/hw2/map.png"
 EXCEL_PATH = "/home/clu98753cs13/Desktop/course/phyai/physical-ai25/hw2/color_coding_semantic_segmentation_classes.xlsx"
 
-# RRT 參數
-STEP_SIZE = 10
-MAX_ITER = 5000
-GOAL_SAMPLE_RATE = 0.05
+# ==========================================================
+# RRT* 參數（像素座標系）
+# ==========================================================
+STEP_SIZE          = 5             # 每次延伸步長（px）
+MAX_ITER           = 10000           # 迭代上限
+GOAL_SAMPLE_RATE   = 0.05           # 目標偏置機率
+NEIGHBOR_COEFF     = 60.0           # 鄰居半徑係數 (r = coeff * sqrt(log(n)/n))
+SMOOTH_ITER        = 50            # 路徑平滑化嘗試次數
+INFORMED_SAMPLING  = True           # 找到初始路徑後啟用 Informed RRT*
+GOAL_REACH_THRESH  = 1.5*STEP_SIZE  # 新節點到目標多少距離內視為可接通
+COLLISION_SAMPLES_PER_STEP = 2      # 線段碰撞取樣密度（距離/STEP_SIZE*此係數）
 
 # ==========================================================
-# 輔助結構與函式
+# 結構
 # ==========================================================
-Node = namedtuple("Node", ["x", "y", "parent"])
+class Node:
+    __slots__ = ("x","y","parent","cost")
+    def __init__(self, x:float, y:float, parent=None, cost:float=0.0):
+        self.x = float(x)
+        self.y = float(y)
+        self.parent = parent
+        self.cost = float(cost)
 
+    @property
+    def pt(self):
+        return (self.x, self.y)
+
+
+# ==========================================================
+# 幾何輔助
+# ==========================================================
 def distance(p1, p2):
-    return math.hypot(p1[0] - p2[0], p1[1] - p2[1])
+    return math.hypot(p1[0]-p2[0], p1[1]-p2[1])
 
-def steer(from_node, to_point, step_size):
-    dx = to_point[0] - from_node.x
-    dy = to_point[1] - from_node.y
-    dist = math.hypot(dx, dy)
-    if dist == 0:
-        return None
-    ratio = step_size / dist
-    new_x = int(from_node.x + dx * ratio)
-    new_y = int(from_node.y + dy * ratio)
-    return Node(new_x, new_y, from_node)
+def is_inside(map_img, x, y):
+    return 0 <= x < map_img.shape[1] and 0 <= y < map_img.shape[0]
 
-def is_collision_free(map_img, node1, node2):
-    """沿線取樣確認是否穿越障礙 (黑色)"""
-    x1, y1 = node1.x, node1.y
-    x2, y2 = node2.x, node2.y
-    line_points = np.linspace((x1, y1), (x2, y2), num=20)
-    for x, y in line_points:
-        if (int(y) >= map_img.shape[0] or int(x) >= map_img.shape[1] or
-            int(x) < 0 or int(y) < 0):
-            return False
-        if map_img[int(y), int(x)] == 0:  # 黑色障礙物
+def is_free_pixel(map_img, x, y, radius=1.0):
+    """
+    支援浮點座標的安全性檢查：
+    - 在 (x, y) 周圍取 13 個鄰點
+    - 只要其中一個是 free (像素值 >=128) 即視為 free
+    - radius 控制取樣的距離 (像素)：若要放大探測區域（像素距離），可乘上 radius
+    """
+    H, W = map_img.shape[:2]
+    cx, cy = int(round(x)), int(round(y))
+
+    # 13 點 pattern（中心 + 第一圈 8 點 + 第二圈 4 點）
+    offsets = [
+        (0, 0),  # 中心
+        (-1, 0), (1, 0), (0, -1), (0, 1),  # 十字
+        (-1, -1), (-1, 1), (1, -1), (1, 1),  # 斜角
+        (-2, 0), (2, 0), (0, -2), (0, 2)  
+    ]
+
+    for dx, dy in offsets:
+        xx = int(round(cx + dx * radius))
+        yy = int(round(cy + dy * radius))
+        if 0 <= xx < W and 0 <= yy < H:
+            if map_img[yy, xx] >= 128:
+                return True
+
+    return False
+
+
+
+def line_collision_free(map_img, p1, p2):
+    """支援浮點採樣的線段碰撞"""
+    dist = distance(p1, p2)
+    n = int(COLLISION_SAMPLES_PER_STEP * dist / max(1.0, STEP_SIZE)) + 2
+    xs = np.linspace(p1[0], p2[0], n)
+    ys = np.linspace(p1[1], p2[1], n)
+    for x, y in zip(xs, ys):
+        if not is_free_pixel(map_img, x, y):
             return False
     return True
 
+
+def steer(from_node, to_point, step_size=STEP_SIZE):
+    """從 from_node 朝 to_point 延伸一步（或到 to_point），傳回新 Node"""
+    dx = to_point[0] - from_node.x
+    dy = to_point[1] - from_node.y
+    dist = math.hypot(dx, dy)
+    if dist < 1e-6:
+        return None
+    if dist <= step_size:
+        nx, ny = to_point[0], to_point[1]
+    else:
+        nx = from_node.x + step_size * dx / dist
+        ny = from_node.y + step_size * dy / dist
+
+    return Node(nx, ny)
+
 def nearest(nodes, point):
-    nearest_node = nodes[0]
-    min_dist = float("inf")
-    for node in nodes:
-        d = distance((node.x, node.y), point)
-        if d < min_dist:
-            nearest_node = node
-            min_dist = d
-    return nearest_node
+    best, best_d = None, float("inf")
+    px, py = point
+    for n in nodes:
+        d = (n.x - px)**2 + (n.y - py)**2  # 用平方距離省 sqrt
+        if d < best_d:
+            best_d = d; best = n
+    return best
+
+def near(nodes, new_node, radius):
+    r2 = radius*radius
+    out = []
+    for n in nodes:
+        dx = n.x - new_node.x
+        dy = n.y - new_node.y
+        if dx*dx + dy*dy <= r2:
+            out.append(n)
+    return out
 
 def extract_path(goal_node):
     path = []
-    node = goal_node
-    while node is not None:
-        path.append((node.x, node.y))
-        node = node.parent
+    n = goal_node
+    while n is not None:
+        path.append((n.x, n.y))
+        n = n.parent
     path.reverse()
     return path
 
+def path_length_px(path):
+    if not path or len(path) < 2: return 0.0
+    return sum(distance(path[i], path[i+1]) for i in range(len(path)-1))
+
 # ==========================================================
-# 語意表處理
+# Informed 取樣（在已知最佳路徑長 c_best 後，於包含 start/goal 的橢圓內取樣）
 # ==========================================================
-def load_semantic_table(excel_path):
-    """
-    從 Excel 語意表讀取每個類別的 RGB 顏色。
-    支援格式：
-    - Color_Code (R,G,B)
-    - Color
-    - Name
-    """
-    df = pd.read_excel(excel_path)
-    
-    # 自動找欄位名稱（有時 Excel 欄位有空白）
-    color_col = None
-    name_col = None
-    for c in df.columns:
-        if "Color_Code" in c and "(R" in c:  # 找 "(R,G,B)"
-            color_col = c
-        elif c.strip().lower() in ["name", "class", "object", "color name", "Color"]:
-            name_col = c
+def sample_informed(start, goal, c_best, rng, map_shape):
+    # 若 c_best 無限大，回傳 None 代表退回 uniform
+    c_min = distance(start, goal)
+    if not np.isfinite(c_best) or c_best <= c_min + 1e-6:
+        return None
 
-    if color_col is None or name_col is None:
-        raise ValueError(f"❌ 無法在 Excel 中找到顏色或名稱欄位，檢查欄名：{list(df.columns)}")
+    # 橢圓參數
+    a = c_best / 2.0               # 橢圓長半軸
+    b = math.sqrt(max(a*a - (c_min/2.0)**2, 1e-6))  # 短半軸
+    # 旋轉角（start→goal）
+    theta = math.atan2(goal[1]-start[1], goal[0]-start[0])
 
-    color_map = {}
+    # 在單位圓內取樣，再放縮成橢圓
+    r = math.sqrt(rng.random())
+    ang = 2*math.pi*rng.random()
+    x_e = r * math.cos(ang) * a
+    y_e = r * math.sin(ang) * b
 
-    for _, row in df.iterrows():
-        name = str(row[name_col]).strip().lower()
-        color_str = str(row[color_col]).strip()
+    # 旋轉 & 平移到世界座標（像素）
+    c = math.cos(theta); s = math.sin(theta)
+    x = x_e * c - y_e * s + (start[0] + goal[0]) / 2.0
+    y = x_e * s + y_e * c + (start[1] + goal[1]) / 2.0
 
-        # 解析字串格式 "(R, G, B)"
-        nums = [int(v) for v in color_str.replace("(", "").replace(")", "").split(",") if v.strip().isdigit()]
-        if len(nums) != 3:
+    # 保底：若落在障礙或越界就返回 None（外層會改用 uniform）
+    x_i, y_i = int(round(x)), int(round(y))
+    H, W = map_shape
+    if 0 <= x_i < W and 0 <= y_i < H:
+        return (x_i, y_i)
+    return None
+
+# ==========================================================
+# 路徑平滑化（Shortcut smoothing）
+# ==========================================================
+def smooth_path(map_img, path, iterations=SMOOTH_ITER):
+    if not path or len(path) < 3: 
+        return path
+    P = list(path)
+    rng = random.Random(0xC0FFEE)
+    for _ in range(iterations):
+        i, j = sorted(rng.sample(range(len(P)), 2))
+        if j - i <= 1:
             continue
-        color_map[name] = tuple(nums)
+        if line_collision_free(map_img, P[i], P[j]):
+            P = P[:i+1] + P[j:]
+    return P
 
-    print(f"[INFO] 成功載入 {len(color_map)} 個語意分類。")
-    return color_map
+# ==========================================================
+# RRT* 主算法（介面與舊 rrt_planning 相容）
+# ==========================================================
+def rrt_star_planning(map_img, start, goal):
+    """
+    參數：
+      - map_img: 二值地圖 (uint8)，255 可行走、0 障礙
+      - start, goal: (x,y) 像素座標
+    回傳：
+      - path: [(x,y), ...] 或 None
+      - nodes: [Node, ...]（包含 parent/cost）
+    """
+    H, W = map_img.shape[:2]
+    # === ✅ 起點/終點合法性檢查 + 視覺化提示 (自動存圖) ===
+    if not is_free_pixel(map_img, start[0], start[1]):
+        plt.figure(figsize=(8, 8))
+        plt.imshow(map_img, cmap='gray')
+        plt.scatter(start[0], start[1], c='red', s=80, label='Start (在障礙上!)')
+        plt.scatter(goal[0], goal[1], c='green', s=60, label='Goal')
+        plt.title("⚠️ 起點落在障礙上 - 請重新選擇起點")
+        plt.legend()
+        plt.axis("equal")
+
+        # === 儲存圖像 ===
+        out_path = "start_on_obstacle.png"
+        plt.savefig(out_path, bbox_inches="tight", dpi=200)
+        print(f"❌ [警告] 起點在障礙上，已輸出偵錯圖像：{out_path}")
+        plt.close()
+
+        raise ValueError("❌ 起點 (Start) 落在障礙區，請重新選擇位置。")
+
+    if not is_free_pixel(map_img, goal[0], goal[1]):
+        plt.figure(figsize=(8, 8))
+        plt.imshow(map_img, cmap='gray')
+        plt.scatter(start[0], start[1], c='green', s=60, label='Start')
+        plt.scatter(goal[0], goal[1], c='red', s=80, label='Goal (在障礙上!)')
+        plt.title("⚠️ 目標落在障礙上 - 請檢查語意顏色或地圖設定")
+        plt.legend()
+        plt.axis("equal")
+
+        # === 儲存圖像 ===
+        out_path = "goal_on_obstacle.png"
+        plt.savefig(out_path, bbox_inches="tight", dpi=200)
+        print(f"❌ [警告] 目標在障礙上，已輸出偵錯圖像：{out_path}")
+        plt.close()
+
+        raise ValueError("❌ 目標 (Goal) 落在障礙區，請確認語意分類或地圖。")
 
 
-def find_object_region(map_path, color_map, target_class):
-    img = cv2.imread(map_path)
-    if img is None:
-        raise FileNotFoundError(f"❌ 找不到地圖: {map_path}")
 
-    target_class = target_class.lower()
-    if target_class not in color_map:
-        raise ValueError(f"⚠️ 類別 '{target_class}' 不在語意表中。")
+    rng = random.Random(12345)
 
-    # Excel 是 RGB，OpenCV 是 BGR
-    bgr_color = tuple(reversed(color_map[target_class]))
-    mask = cv2.inRange(img, bgr_color, bgr_color)
+    start_node = Node(start[0], start[1], parent=None, cost=0.0)
+    nodes = [start_node]
+    best_goal_node = None
+    c_best = float("inf")
 
-    coords = cv2.findNonZero(mask)
-    if coords is None:
-        raise ValueError(f"⚠️ 找不到目標類別 '{target_class}' 的區域。")
+    for it in range(MAX_ITER):
 
-    mean = np.mean(coords, axis=0)[0]
-    goal = (int(mean[0]), int(mean[1]))
+        # --- 取樣（含 goal bias 與 Informed 模式） ---
+        if rng.random() < GOAL_SAMPLE_RATE:
+            sample = goal
+        else:
+            # 若已有路徑且開啟 Informed，於橢圓區域取樣
+            if INFORMED_SAMPLING and np.isfinite(c_best):
+                sample = sample_informed(start, goal, c_best, rng, (H, W))
+                if sample is None:
+                    # fallback uniform
+                    sample = (rng.randrange(W), rng.randrange(H))
+            else:
+                sample = (rng.randrange(W), rng.randrange(H))
 
-    print(f"[INFO] {target_class} 目標中心座標: {goal}")
-    return goal, mask
+        # 無效點（障礙/越界）直接跳過
+        if not is_free_pixel(map_img, sample[0], sample[1]):
+            continue
 
-def select_start(map_path, goal):
-    img = cv2.imread(map_path)
-    img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-    plt.imshow(img_rgb)
-    plt.scatter(goal[0], goal[1], c='red', s=80, label='Goal')
-    plt.title("點選起點 (Start)")
-    plt.legend()
-    pts = plt.ginput(1, timeout=0)
-    plt.close()
-    start = tuple(map(int, pts[0]))
-    return start
+        # --- 找最近點 + 延伸 ---
+        nearest_node = nearest(nodes, sample)
+        new_node = steer(nearest_node, sample, STEP_SIZE)
+        if new_node is None:
+            continue
+        if not is_free_pixel(map_img, new_node.x, new_node.y):
+            continue
+        if not line_collision_free(map_img, nearest_node.pt, new_node.pt):
+            continue
+
+        # --- RRT*：挑成本最小的 parent（本地最佳連接） ---
+        n = len(nodes)
+        radius = NEIGHBOR_COEFF * math.sqrt(max(math.log(n)/n, 1e-9))
+        neighbors = near(nodes, new_node, radius) or [nearest_node]
+
+        # 先以最近的當 baseline
+        best_parent = nearest_node
+        best_cost = best_parent.cost + distance(best_parent.pt, new_node.pt)
+
+        for nb in neighbors:
+            cand_cost = nb.cost + distance(nb.pt, new_node.pt)
+            if cand_cost + 1e-6 < best_cost and line_collision_free(map_img, nb.pt, new_node.pt):
+                best_parent = nb
+                best_cost = cand_cost
+
+        new_node.parent = best_parent
+        new_node.cost = best_cost
+        nodes.append(new_node)
+
+        # --- RRT*：Rewire 附近節點（若經由 new_node 更短且可行，改其 parent） ---
+        for nb in neighbors:
+            if nb is new_node or nb is best_parent:
+                continue
+            new_cost = new_node.cost + distance(new_node.pt, nb.pt)
+            if new_cost + 1e-6 < nb.cost and line_collision_free(map_img, new_node.pt, nb.pt):
+                nb.parent = new_node
+                nb.cost = new_cost
+
+        # --- 嘗試接通到 Goal（在距離門檻內且線段可行） ---
+        if distance(new_node.pt, goal) <= GOAL_REACH_THRESH:
+            if line_collision_free(map_img, new_node.pt, goal):
+                goal_node = Node(goal[0], goal[1], parent=new_node,
+                                 cost=new_node.cost + distance(new_node.pt, goal))
+                # 更新最佳解
+                if goal_node.cost < c_best:
+                    best_goal_node = goal_node
+                    c_best = goal_node.cost
+
+        #（可選）每隔一段輸出一次進度
+        # if it % 1000 == 0:
+        #     print(f"[{it}] nodes={len(nodes)} c_best={c_best:.1f}")
+
+    # === 收尾 ===
+    if best_goal_node is None:
+        print("❌ 未找到可行路徑。")
+        return None, nodes
+
+    raw_path = extract_path(best_goal_node)
+    smooth = smooth_path(map_img, raw_path, iterations=SMOOTH_ITER)
+    return smooth, nodes
 
 # ==========================================================
 # RRT 主演算法
@@ -181,87 +360,126 @@ def rrt_planning(map_img, start, goal):
     return None, nodes
 
 # ==========================================================
-# 視覺化
+# ======= 以下部份保留你原本的語意表/互動/視覺化 =======
 # ==========================================================
+def load_semantic_table(excel_path):
+    df = pd.read_excel(excel_path)
+    color_col = None
+    name_col = None
+    for c in df.columns:
+        if "Color_Code" in c and "(R" in c:
+            color_col = c
+        elif c.strip().lower() in ["name", "class", "object", "color", "color name"]:
+            name_col = c
+    if color_col is None or name_col is None:
+        raise ValueError(f"❌ 無法在 Excel 中找到顏色或名稱欄位，檢查欄名：{list(df.columns)}")
+    color_map = {}
+    for _, row in df.iterrows():
+        name = str(row[name_col]).strip().lower()
+        color_str = str(row[color_col]).strip()
+        nums = [int(v) for v in color_str.replace("(", "").replace(")", "").split(",") if v.strip().isdigit()]
+        if len(nums) == 3:
+            color_map[name] = tuple(nums)
+    print(f"[INFO] 成功載入 {len(color_map)} 個語意分類。")
+    return color_map
+
+def find_object_region(map_path, color_map, target_class):
+    img = cv2.imread(map_path)
+    if img is None:
+        raise FileNotFoundError(f"❌ 找不到地圖: {map_path}")
+    target_class = target_class.lower()
+    if target_class not in color_map:
+        raise ValueError(f"⚠️ 類別 '{target_class}' 不在語意表中。")
+    bgr_color = tuple(reversed(color_map[target_class]))  # Excel 是 RGB，OpenCV BGR
+    mask = cv2.inRange(img, bgr_color, bgr_color)
+    coords = cv2.findNonZero(mask)
+    if coords is None:
+        raise ValueError(f"⚠️ 找不到目標類別 '{target_class}' 的區域。")
+    mean = np.mean(coords, axis=0)[0]
+    goal = (int(mean[0]), int(mean[1]))
+    print(f"[INFO] {target_class} 目標中心座標: {goal}")
+    return goal, mask
+
+def select_start(map_path, goal):
+    img = cv2.imread(map_path)
+    img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+    plt.imshow(img_rgb)
+    plt.scatter(goal[0], goal[1], c='red', s=80, label='Goal')
+    plt.title("點選起點 (Start)")
+    plt.legend()
+    pts = plt.ginput(1, timeout=0)
+    plt.close()
+    start = tuple(map(int, pts[0]))
+    return start
+
 def visualize_rrt(map_img, nodes, start, goal, path):
     plt.figure(figsize=(8, 8))
     plt.imshow(map_img, cmap='gray')
     plt.plot(start[0], start[1], "go", markersize=8, label="Start")
     plt.plot(goal[0], goal[1], "ro", markersize=8, label="Goal")
-
     for node in nodes:
         if node.parent is not None:
             plt.plot([node.x, node.parent.x], [node.y, node.parent.y], "b-", linewidth=0.4)
-
     if path:
         px, py = zip(*path)
-        plt.plot(px, py, "r-", linewidth=2.0, label="Path")
-
+        plt.plot(px, py, "r-", linewidth=2.0, label="Path (RRT* + smooth)")
     plt.legend()
     plt.axis("equal")
     plt.show()
 
 # ==========================================================
-# 主流程
+# 主流程（與你原本一致，唯改用 RRT*）
 # ==========================================================
 if __name__ == "__main__":
-    print("=== HW2 Part2: Semantic-guided RRT Path Planning ===")
-    # 載入地圖
-    map_img_gray = cv2.imread(MAP_PATH, cv2.IMREAD_GRAYSCALE)
-    binary_map = np.where(map_img_gray > 100, 255, 0).astype(np.uint8)
+    print("=== HW2 Part2: Semantic-guided RRT* Path Planning (w/ Informed + Smoothing) ===")
 
+    # 讀地圖並二值化（白=free=255，黑=obs=0）
+    map_img_gray = cv2.imread(MAP_PATH, cv2.IMREAD_GRAYSCALE)
+    if map_img_gray is None:
+        raise FileNotFoundError(MAP_PATH)
     _, binary_map = cv2.threshold(map_img_gray, 240, 255, cv2.THRESH_BINARY)
 
-    # ==========================================================
+    # 加一道「安全膨脹」：侵蝕可行區（可選，用來避免鑽窄縫）
+    # kernel = np.ones((11, 11), np.uint8)
+    # binary_map = cv2.erode(binary_map, kernel, iterations=1)
+
     # Step 1. 載入語意表與地圖
-    # ==========================================================
     color_map = load_semantic_table(EXCEL_PATH)
     map_img = cv2.imread(MAP_PATH)
     if map_img is None:
         raise FileNotFoundError(f"❌ 找不到地圖: {MAP_PATH}")
 
-    # ==========================================================
     # Step 2. 掃描地圖中實際出現的顏色
-    # ==========================================================
-    # 將 map.png 所有像素壓平成一組唯一 RGB 集合
     unique_colors = np.unique(map_img.reshape(-1, 3), axis=0)
     unique_colors_set = {tuple(color.tolist()) for color in unique_colors}
-
-    # 找出這些顏色在語意表中對應的物件
     available_classes = []
     for name, rgb in color_map.items():
-        bgr = tuple(reversed(rgb))  # Excel 是 RGB, OpenCV 是 BGR
+        bgr = tuple(reversed(rgb))
         if bgr in unique_colors_set:
             available_classes.append(name)
-
     if not available_classes:
-        raise RuntimeError("❌ 無法在 map.png 找到任何語意類別，請確認顏色與語意表一致。")
+        raise RuntimeError("❌ map.png 找不到任何語意類別，請確認顏色與語意表一致。")
+    print(f"[INFO] 可用的目標類別（出現在地圖上）：{available_classes}")
 
-    print(f"[INFO] 此地圖中實際可用的目標類別共有 {len(available_classes)} 種：")
-    print(available_classes)
-
-    # ==========================================================
-    # Step 3. 讓使用者輸入目標物件（僅限存在於地圖的）
-    # ==========================================================
+    # Step 3. 讓使用者輸入目標並選起點
     target_class = input(f"請輸入目標類別 {available_classes}: ").strip().lower()
     if target_class not in available_classes:
         raise ValueError(f"⚠️ '{target_class}' 不在地圖可用清單中。")
-
-    # 找出目標區域中心
     goal, mask = find_object_region(MAP_PATH, color_map, target_class)
-
-    # 讓使用者選擇起點
     start = select_start(MAP_PATH, goal)
 
-    # 執行 RRT
-    path, nodes = rrt_planning(binary_map, start, goal)
+    # 執行 RRT*（介面與舊版相同）
+    path, nodes = rrt_star_planning(binary_map, start, goal)
 
     # 顯示結果
     if path:
         visualize_rrt(binary_map, nodes, start, goal, path)
-        print(f"[INFO] 路徑長度: {len(path)}")
+        print(f"[INFO] 路徑長度（像素）: {path_length_px(path):.1f} | 節點數: {len(nodes)}")
         result_img = cv2.cvtColor(binary_map, cv2.COLOR_GRAY2BGR)
         for i in range(len(path)-1):
             cv2.line(result_img, path[i], path[i+1], (0, 0, 255), 2)
-        cv2.imwrite(f"rrt_result_{target_class}.png", result_img)
-        print(f"[INFO] 結果已儲存至 rrt_result_{target_class}.png")
+        out = f"rrt_star_result_{target_class}.png"
+        cv2.imwrite(out, result_img)
+        print(f"[INFO] 結果已儲存至 {out}")
+    else:
+        print("[INFO] 無路徑產生")

@@ -16,6 +16,7 @@ import matplotlib.pyplot as plt
 # 動作生成（安全版本）
 # ==========================================================
 FORWARD_STEP = 0.05
+ARRIVAL_JUDGE = FORWARD_STEP*1.5
 TURN_ANGLE = 1
 ARRIVAL_THRESH = 0.15
 MAX_ACTIONS = 5000
@@ -68,8 +69,14 @@ class HabitatEnvWrapper:
 
     def step(self, action: str):
         obs = self.sim.step(action)
+        color_data = obs["color_sensor"] 
+        if color_data.shape[2] == 4:
+            rgb_img = color_data[:, :, :3]
+        else:
+            rgb_img = color_data
+
         return {
-            "rgb": obs["color_sensor"][:, :, [2, 1, 0]],
+            "rgb": rgb_img, # 現在確保是 (H, W, 3)
             "depth": obs["depth_sensor"],
             "semantic": self._decode_semantic(obs["semantic_sensor"]),
         }
@@ -133,7 +140,7 @@ def world_to_pixel(x, z, w, h, bounds):
     u = u_ratio * w
     v = v_ratio * h
 
-    return int(round(u)), int(round(v))
+    return u,v
 
 
 def wrap_to_pi(a): return (a + math.pi) % (2 * math.pi) - math.pi
@@ -254,7 +261,7 @@ def run_navigation_replan(env, binary_map,safe_binary_map, color_map, bounds, st
     current_pos = current_state.position.copy()
 
     # === 初始路徑規劃 ===
-    path_pixel, _ = rrt_planning(safe_binary_map, start, goal)
+    path_pixel, _ = rrt_star_planning(safe_binary_map, start, goal)
     world_path = [pixel_to_world(u, v, w, h, bounds) for (u, v) in path_pixel]
     # actions = generate_actions_from_world_path(world_path)
     
@@ -271,88 +278,370 @@ def run_navigation_replan(env, binary_map,safe_binary_map, color_map, bounds, st
                     world_path[i+1][1]-world_path[i][1])
         for i in range(len(world_path)-1)]))
     count = 0
+    try:
+        while True:
+            count +=1
+            print(f"replan count:{count}")
+            for act in actions:
+                obs = env.step(act)
+                print(f"obs:",obs["depth"].shape)
+                depth = obs["depth"]  # shape: (512, 512)
 
-    while True:
-        count +=1
-        print(f"replan count:{count}")
-        for act in actions:
-            obs = env.step(act)
-            pos = env.agent.get_state().position.copy()
-            dist_to_goal = np.linalg.norm(pos[[0, 2]] - np.array(world_path[-1]))
-            dist_to_path = distance_to_path(pos, world_path)
-            print(f"[DEBUG] pos=({pos[0]:.2f},{pos[2]:.2f}), "
-                f"goal=({world_path[-1][0]:.2f},{world_path[-1][1]:.2f}), "
-                f"dist_to_goal={dist_to_goal:.3f}, dist_to_path={dist_to_path:.3f}")
-            # ======= 三種事件偵測 =======
-            if dist_to_goal < 0.00001:
-                print(f"[SUCCESS] Reached goal ✅ ({pos[0]:.2f}, {pos[2]:.2f})")
+                # 範例：定義幾個距離層（單位公尺）
+                near = (depth < 0.4)          # 很近的東西
+                mid  = (depth >= 0.4) & (depth < 1.5)
+                far  = (depth >= 1.5)
+
+                # 這樣你可以看到每一層的布林遮罩
+                print(np.sum(near), np.sum(mid), np.sum(far))  # 各層有多少像素
+                pos = env.agent.get_state().position.copy()
+                dist_to_goal = np.linalg.norm(pos[[0, 2]] - np.array(world_path[-1]))
+                dist_to_path = distance_to_path(pos, world_path)
+                print(f"[DEBUG] pos=({pos[0]:.2f},{pos[2]:.2f}), "
+                    f"goal=({world_path[-1][0]:.2f},{world_path[-1][1]:.2f}), "
+                    f"dist_to_goal={dist_to_goal:.3f}, dist_to_path={dist_to_path:.3f}")
+                # ======= 三種事件偵測 =======
+                if dist_to_goal < ARRIVAL_JUDGE:
+                    print(f"[SUCCESS] Reached goal ✅ ({pos[0]:.2f}, {pos[2]:.2f})")
+                    vw.release()
+                    print(f"[END] Navigation finished, {frame_count} frames saved.")
+
+                    return
+                move_dist = np.linalg.norm(pos - current_pos)
+
+                if dist_to_path > replan_thresh:
+                    # print(f"[REPLAN] Deviated from path ({dist_to_path:.2f} m) → 重新規劃")
+                    current_pos = pos.copy()
+                    break  # 退出內層 loop，重新規劃
+
+                if move_dist < 0.01:
+                    stuck_counter += 1
+                else:
+                    stuck_counter = 0
+
+                if stuck_counter > 20:
+                    # print("[REPLAN] Agent stuck → 重新規劃")
+                    current_pos = pos.copy()
+                    break  # 跳出重新規劃
+                current_pos = pos.copy()
+                # === 繪製畫面 ===
+                rgb = obs["rgb"]
+                mask = target_mask(obs)
+                vis = overlay_mask(rgb, mask)
+                for sub in range(FPS//15):  # 每個動作輸出3幀
+                    vw.write(cv2.cvtColor(vis, cv2.COLOR_RGB2BGR))
+                    frame_count += 1
+                if frame_count % 10 == 0:
+                    print(f"[DEBUG] 已寫入 {frame_count} 幀到影片")
+
+                # current_pos = pos.copy()
+            else:
+                # 如果沒 break（未重規劃）則繼續
+                continue
+
+            # ======= 重新規劃 =======
+            # print(current_pos[0], current_pos[2], bounds, w, h)
+            # print("[DEBUG] bounds =", bounds)
+
+            start_pixel = world_to_pixel(current_pos[0], current_pos[2], w, h, bounds)
+            try:
+                path_pixel, _ = rrt_star_planning(safe_binary_map, start_pixel, goal)
+            except Exception as e:
+                print(f"❌ [ERROR] 重新規劃失敗: {e}")
+                raise  # 保證影片會被 finally 釋放
+            counter = 0
+            while path_pixel is None:
+                print(f"❌ [REPLAN FAIL] 無法找到可行路徑， again。{start_pixel}")
+                try:
+                    path_pixel, _ = rrt_star_planning(safe_binary_map, start_pixel, goal)
+                except Exception as e:
+                    print(f"❌ [ERROR] 重新規劃失敗: {e}")
+                    raise  # 保證影片會被 finally 釋放
+                counter +=1
+                if path_pixel or counter >=10:
+                    break
+            if counter >=10  or count>50 : # or count>20
+                print(f"[Fail] counter:{counter},frame count:{frame_count},count:{count}")
+                print(f"[Fail] not Reached goal but fail to find path ({pos[0]:.2f}, {pos[2]:.2f})")
                 vw.release()
                 print(f"[END] Navigation finished, {frame_count} frames saved.")
-
                 return
-            move_dist = np.linalg.norm(pos - current_pos)
-
-            if dist_to_path > replan_thresh:
-                # print(f"[REPLAN] Deviated from path ({dist_to_path:.2f} m) → 重新規劃")
-                current_pos = pos.copy()
-                break  # 退出內層 loop，重新規劃
-
-            if move_dist < 0.01:
-                stuck_counter += 1
-            else:
-                stuck_counter = 0
-
-            if stuck_counter > 20:
-                # print("[REPLAN] Agent stuck → 重新規劃")
-                current_pos = pos.copy()
-                break  # 跳出重新規劃
-            current_pos = pos.copy()
-            # === 繪製畫面 ===
-            rgb = obs["rgb"]
-            mask = target_mask(obs)
-            vis = overlay_mask(rgb, mask)
-            for sub in range(FPS//15):  # 每個動作輸出3幀
-                vw.write(cv2.cvtColor(vis, cv2.COLOR_RGB2BGR))
-                frame_count += 1
-            if frame_count % 10 == 0:
-                print(f"[DEBUG] 已寫入 {frame_count} 幀到影片")
-
-            # current_pos = pos.copy()
-        else:
-            # 如果沒 break（未重規劃）則繼續
-            continue
-
-        # ======= 重新規劃 =======
-        # print(current_pos[0], current_pos[2], bounds, w, h)
-        # print("[DEBUG] bounds =", bounds)
-
-        start_pixel = world_to_pixel(current_pos[0], current_pos[2], w, h, bounds)
-        path_pixel, _ = rrt_planning(safe_binary_map, start_pixel, goal)
-        counter = 0
-        while path_pixel is None:
-            print(f"❌ [REPLAN FAIL] 無法找到可行路徑， again。{start_pixel}")
-            path_pixel, _ = rrt_planning(safe_binary_map, start_pixel, goal)
-            counter +=1
-            if path_pixel or counter >=10:
-                break
-        if counter >=10  or count>50 : # or count>20
-            print(f"[Fail] counter:{counter},frame count:{frame_count},count:{count}")
-            print(f"[Fail] not Reached goal but fail to find path ({pos[0]:.2f}, {pos[2]:.2f})")
-            vw.release()
-            print(f"[END] Navigation finished, {frame_count} frames saved.")
-            return
+            
+            world_path = [pixel_to_world(u, v, w, h, bounds) for (u, v) in path_pixel]
+            # actions = generate_actions_from_world_path(world_path)
+            q_replan = current_state.rotation
+            replan_yaw = 2 * math.atan2(q_replan.imag[1], q_replan.real)
+            
+            actions = generate_actions_from_world_path(world_path, current_yaw_rad=replan_yaw)
+            counter = 0
+            # print(f"[INFO] Replan done: {len(world_path)} points, {len(actions)} actions.")
         
-        world_path = [pixel_to_world(u, v, w, h, bounds) for (u, v) in path_pixel]
-        # actions = generate_actions_from_world_path(world_path)
-        q_replan = current_state.rotation
-        replan_yaw = 2 * math.atan2(q_replan.imag[1], q_replan.real)
-        
-        actions = generate_actions_from_world_path(world_path, current_yaw_rad=replan_yaw)
-        counter = 0
-        # print(f"[INFO] Replan done: {len(world_path)} points, {len(actions)} actions.")
+    except KeyboardInterrupt:
+        print("\n🛑 [INTERRUPT] 使用者手動中斷，保存錄影...")
+
+    except Exception as e:
+        print(f"\n❌ [UNCAUGHT ERROR] {type(e).__name__}: {e}")
+        print("🚨 自動保存目前錄影並退出。")
+
+    finally:
+        # 保證影片與環境釋放
+        if vw is not None:
+            try:
+                vw.release()
+                print(f"[SAVE] 影片已安全保存 ({frame_count} 幀)")
+            except Exception as e:
+                print(f"[WARN] 影片釋放出錯: {e}")
+
+        try:
+            env.sim.close()
+            print("[CLEANUP] 模擬器已關閉 ✅")
+        except Exception as e:
+            print(f"[WARN] 模擬器關閉出錯: {e}")
 
     vw.release()
     print(f"[END] Navigation finished, {frame_count} frames saved.")
+
+
+
+# def run_navigation_replan(env, binary_map,safe_binary_map, color_map, bounds, start, goal, target_mask,
+#                         output_video="result_replan.mp4", replan_thresh=ARRIVAL_JUDGE*0.95):
+#     """
+#     主導航流程：
+#     1. RRT 全域路徑規劃
+#     2. Proactive Avoidance (主動避障)
+#     3. Reactive Replan (反應式重新規劃)
+#     4. Oscillation Escape (震盪脫困)
+#     """
+#     vw = cv2.VideoWriter(output_video, cv2.VideoWriter_fourcc(*"mp4v"), FPS, (512, 512))
+#     stuck_counter = 0
+#     frame_count = 0
+#     h, w = binary_map.shape
+
+#     # === ✅ NEW: 脫困狀態機 ===
+#     # 追蹤 "被動卡住" (stuck_counter) 的脫困嘗試
+#     # 0=未嘗試, 1=已嘗試右轉90度, 2=已嘗試左轉90度, 3=已嘗試180度
+#     stuck_escape_level = 0
+#     # ==========================
+
+#     obs = env.step("turn_right") # dict_keys(['rgb', 'depth', 'semantic'])
+#     current_state = env.agent.get_state()
+#     current_pos = current_state.position.copy()
+
+#     # === 初始路徑規劃 ===
+#     path_pixel, _ = rrt_star_planning(safe_binary_map, start, goal)
+#     world_path = [pixel_to_world(u, v, w, h, bounds) for (u, v) in path_pixel]
+#     world_path = simplify_path(world_path, min_step=0.4)
+
+#     q = current_state.rotation
+#     init_yaw = 2 * math.atan2(q.imag[1], q.real)
+#     actions = generate_actions_from_world_path(world_path, current_yaw_rad=init_yaw)
+    
+#     print(f"[INIT] RRT 路徑生成完成，共 {len(world_path)} 點")
+
+#     # (系統 A) 震盪偵測器
+#     avoidance_turn_counter = 0
+#     OSCILLATION_LIMIT = 25 
+#     count = 0
+#     try:
+#         while True:
+#             count +=1
+#             print(f"replan count:{count}")
+            
+#             for act_planned in actions:
+                
+#                 # === 系統 A: 主動避障邏輯 ===
+#                 depth = obs["depth"]
+#                 h_depth, w_depth = depth.shape
+                
+#                 center_h_min = int(h_depth * 0.3)  # 只看前方 (畫面的下半部)
+#                 center_h_max = h_depth
+                
+#                 # 只在限定區域內計算 near_mask
+#                 near_depth_slice = depth
+#                 near_mask = (near_depth_slice < 0.65) # 使用調整後的 0.8m
+#                 near_pixel_count = np.sum(near_mask)
+#                 print(f"obs count:{near_pixel_count}, avoidance_turn_counter:{avoidance_turn_counter}")
+                
+#                 OBSTACLE_THRESHOLD = 1000 # 調整後的閾值
+                
+#                 action_to_take = act_planned
+#                 pos = env.agent.get_state().position.copy()
+#                 dist_to_goal = np.linalg.norm(pos[[0, 2]] - np.array(world_path[-1]))
+
+#                 if act_planned == "move_forward" and near_pixel_count > OBSTACLE_THRESHOLD and dist_to_goal>0.65:
+#                     print("主動避障")
+#                     left_side_near = np.sum(near_mask[:, :near_depth_slice.shape[1]//2])
+#                     right_side_near = np.sum(near_mask[:, near_depth_slice.shape[1]//2:])
+                    
+#                     if left_side_near > right_side_near:
+#                         action_to_take = "turn_right"
+#                     else:
+#                         action_to_take = "turn_left"
+#                     avoidance_turn_counter +=1
+                    
+#                 elif act_planned == "move_forward":
+#                     # 成功前進，重置 [主動避障] 計數器
+#                     avoidance_turn_counter -=1
+#                 # === END: 主動避障 ===
+
+#                 # === 系統 A: 脫困 (B計畫) ===
+#                 if avoidance_turn_counter > OSCILLATION_LIMIT:
+#                     print("🆘 [ESCAPE A] 偵測到 [主動避障震盪]，嘗試 [主要脫困 - 轉 180 度]")
+                    
+#                     turn_steps = 90 // TURN_ANGLE 
+#                     for i in range(turn_steps):
+#                         obs = env.step("turn_right") 
+#                         # ... (錄影) ...
+#                         rgb = obs["rgb"]; mask = target_mask(obs); vis = overlay_mask(rgb, mask)
+#                         for sub in range(FPS//15): vw.write(cv2.cvtColor(vis, cv2.COLOR_RGB2BGR)); frame_count += 1
+                    
+#                     current_pos = env.agent.get_state().position.copy()
+#                     stuck_escape_level = 0 # 重置 "被動脫困" 狀態
+#                     avoidance_turn_counter = 0
+#                     break # 觸發重新規劃
+#                 # === END: 系統 A 脫困 ===
+
+#                 # 執行動作
+#                 obs = env.step(action_to_take) 
+#                 pos = env.agent.get_state().position.copy()
+#                 dist_to_goal = np.linalg.norm(pos[[0, 2]] - np.array(world_path[-1]))
+#                 dist_to_path = distance_to_path(pos, world_path)
+#                 print(f"[DEBUG] pos=({pos[0]:.2f},{pos[2]:.2f}), "
+#                     f"goal=({world_path[-1][0]:.2f},{world_path[-1][1]:.2f}), "
+#                     f"dist_to_goal={dist_to_goal:.3f}, dist_to_path={dist_to_path:.3f}")
+#                 # --- 事件偵測 ---
+#                 if dist_to_goal < ARRIVAL_JUDGE:
+#                     print(f"[SUCCESS] Reached goal ✅ ({pos[0]:.2f}, {pos[2]:.2f})")
+#                     vw.release()
+#                     return
+
+#                 if dist_to_path > replan_thresh:
+#                     print(f"[REPLAN] 偏離路徑 ({dist_to_path:.2f} m) → 重新規劃")
+#                     current_pos = pos.copy()
+#                     stuck_escape_level = 0 # 重置 "被動脫困" 狀態
+#                     break  # 退出內層 loop，重新規劃
+
+#                 # --- ✅ NEW: 系統 B (被動卡住) 脫困邏輯 ---
+#                 move_dist = np.linalg.norm(pos - current_pos)
+                
+#                 if move_dist < 0.01 and action_to_take == "move_forward":
+#                     # 嘗試前進但失敗，累加 "被動卡住" 計數器
+#                     stuck_counter += 1
+#                 else:
+#                     # 任何成功移動 (或轉彎) 都重置計數器
+#                     stuck_counter = 0
+#                     stuck_escape_level = 0 # 只要有移動，就重置脫困等級
+
+#                 if stuck_counter > 20:
+#                     # 觸發了「被動卡住」
+                    
+#                     if stuck_escape_level == 0:
+#                         # 第一次卡住：嘗試右轉 90 度
+#                         print("🆘 [ESCAPE B] Agent [被動卡住]，嘗試 [次要脫困 - 轉 90 度]")
+#                         turn_steps = 90 // TURN_ANGLE
+#                         for i in range(turn_steps):
+#                             obs = env.step("turn_right")
+#                             # ... (錄影) ...
+#                             rgb = obs["rgb"]; mask = target_mask(obs); vis = overlay_mask(rgb, mask)
+#                             for sub in range(FPS//15): vw.write(cv2.cvtColor(vis, cv2.COLOR_RGB2BGR)); frame_count += 1
+#                         stuck_escape_level = 1 # 升級
+
+#                     elif stuck_escape_level == 1:
+#                         # 第二次卡住：嘗試左轉 90 度
+#                         print("🆘 [ESCAPE B] Agent [仍被動卡住]，嘗試 [次要脫困 - 轉 -90 度]")
+#                         turn_steps = 90 // TURN_ANGLE
+#                         for i in range(turn_steps):
+#                             obs = env.step("turn_left")
+#                             # ... (錄影) ...
+#                             rgb = obs["rgb"]; mask = target_mask(obs); vis = overlay_mask(rgb, mask)
+#                             for sub in range(FPS//15): vw.write(cv2.cvtColor(vis, cv2.COLOR_RGB2BGR)); frame_count += 1
+#                         stuck_escape_level = 2 # 升級
+
+#                     else: # stuck_escape_level >= 2
+#                         # 最終嘗試：轉 180 度
+#                         print("🆘 [ESCAPE B] Agent [仍被動卡住]，嘗試 [主要脫困 - 轉 180 度]")
+#                         turn_steps = 180 // TURN_ANGLE
+#                         for i in range(turn_steps):
+#                             obs = env.step("turn_right")
+#                             # ... (錄影) ...
+#                             rgb = obs["rgb"]; mask = target_mask(obs); vis = overlay_mask(rgb, mask)
+#                             for sub in range(FPS//15): vw.write(cv2.cvtColor(vis, cv2.COLOR_RGB2BGR)); frame_count += 1
+#                         stuck_escape_level = 0 # 重置
+                    
+#                     # 執行完任何 "被動脫困" 後，重置計數器並 break 去重新規劃
+#                     current_pos = env.agent.get_state().position.copy()
+#                     stuck_counter = 0 # 重置
+#                     break # 觸發重新規劃
+#                 # --- ✅ END: 系統 B 脫困 ---
+                    
+#                 current_pos = pos.copy()
+                
+#                 # === 繪製畫面 ===
+#                 rgb = obs["rgb"]
+#                 mask = target_mask(obs)
+#                 vis = overlay_mask(rgb, mask)
+#                 for sub in range(FPS//15):
+#                     vw.write(cv2.cvtColor(vis, cv2.COLOR_RGB2BGR))
+#                     frame_count += 1
+#             else:
+#                 continue
+
+#             # ======= 重新規劃 (Re-plan) =======
+#             # (此區塊不變)
+            
+#             start_pixel = world_to_pixel(current_pos[0], current_pos[2], w, h, bounds)
+#             path_pixel, _ = rrt_star_planning(safe_binary_map, start_pixel, goal)
+#             counter = 0
+#             while path_pixel is None:
+#                 print(f"❌ [REPLAN FAIL] 無法找到可行路徑， again。{start_pixel}")
+#                 path_pixel, _ = rrt_star_planning(safe_binary_map, start_pixel, goal)
+#                 counter +=1
+#                 if path_pixel or counter >=20:
+#                     break
+                
+#             if counter >=20  or count>20 :
+#                 print(f"[Fail] counter:{counter},frame count:{frame_count},count:{count}")
+#                 print(f"[Fail] not Reached goal but fail to find path ({pos[0]:.2f}, {pos[2]:.2f})")
+#                 vw.release()
+#                 return
+            
+#             world_path = [pixel_to_world(u, v, w, h, bounds) for (u, v) in path_pixel]
+#             world_path = simplify_path(world_path, min_step=0.4)
+
+#             current_state_replan = env.agent.get_state()
+#             q_replan = current_state_replan.rotation
+#             replan_yaw = 2 * math.atan2(q_replan.imag[1], q_replan.real)
+            
+#             actions = generate_actions_from_world_path(world_path, current_yaw_rad=replan_yaw)
+#             stuck_counter = 0 
+#             print(f"[INFO] Replan done: {len(world_path)} points, {len(actions)} actions.")
+
+        
+#     except KeyboardInterrupt:
+#         print("\n🛑 [INTERRUPT] 使用者手動中斷，保存錄影...")
+
+#     except Exception as e:
+#         print(f"\n❌ [UNCAUGHT ERROR] {type(e).__name__}: {e}")
+#         print("🚨 自動保存目前錄影並退出。")
+
+#     finally:
+#         # 保證影片與環境釋放
+#         if vw is not None:
+#             try:
+#                 vw.release()
+#                 print(f"[SAVE] 影片已安全保存 ({frame_count} 幀)")
+#             except Exception as e:
+#                 print(f"[WARN] 影片釋放出錯: {e}")
+
+#         try:
+#             env.sim.close()
+#             print("[CLEANUP] 模擬器已關閉 ✅")
+#         except Exception as e:
+#             print(f"[WARN] 模擬器關閉出錯: {e}")
+
+#     vw.release()
+#     print(f"[END] Navigation finished, {frame_count} frames saved.")
+
 
 # ==========================================================
 # 導航結果地圖輸出
@@ -398,7 +687,7 @@ if __name__ == "__main__":
     
     print("=== HW2 Part3 (Safe Final Version) ===")
 
-    from part2 import rrt_planning, load_semantic_table, find_object_region
+    from part2 import rrt_star_planning, load_semantic_table, find_object_region , rrt_star_planning
 
     MAP_PATH = "/home/clu98753cs13/Desktop/course/phyai/physical-ai25/hw2/map.png"
     EXCEL_PATH = "/home/clu98753cs13/Desktop/course/phyai/physical-ai25/hw2/color_coding_semantic_segmentation_classes.xlsx"
@@ -411,6 +700,7 @@ if __name__ == "__main__":
     color_map = load_semantic_table(EXCEL_PATH)
     goal, mask = find_object_region(MAP_PATH, color_map, TARGET_CLASS)
     start = (335, 240)
+    start = (236, 457) # test1: 直線行走左右有障礙 可能卡牆
 
     map_gray = cv2.imread(MAP_PATH, cv2.IMREAD_GRAYSCALE)
     _, binary = cv2.threshold(map_gray, 240, 255, cv2.THRESH_BINARY)
@@ -419,7 +709,7 @@ if __name__ == "__main__":
     
     # 決定緩衝區的大小 (kernel 越大，緩衝區越寬，路徑越保守)
     # 5x5 或 7x7 通常是個好的開始
-    kernel_size = 15 
+    kernel_size = 0
     kernel = np.ones((kernel_size, kernel_size), np.uint8)
     
     # 'binary' 中可行走區域是 255 (白色)，障礙物是 0 (黑色)
@@ -429,7 +719,7 @@ if __name__ == "__main__":
     
     print("[INFO] 安全緩衝區建立完畢。")
     # === 解決方案結束 ===
-    path, _ = rrt_planning(safe_binary_map, start, goal)
+    path, _ = rrt_star_planning(safe_binary_map, start, goal)
     if path is None:
         print("❌ 無法找到可行路徑。")
         exit()
@@ -442,9 +732,9 @@ if __name__ == "__main__":
     # world_path = [(x * 40, z * 40) for (x, z) in world_path]  # 保留縮放
     world_path = simplify_path(world_path, min_step=0.25)
     print(f"[INFO] Simplified path from {len(path)} → {len(world_path)} points")
-    for i in range(5):
-        (x1, z1), (x2, z2) = world_path[i], world_path[i+1]
-        print(f"Segment {i}: dist={math.hypot(x2 - x1, z2 - z1):.3f}")
+    # for i in range(5):
+    #     (x1, z1), (x2, z2) = world_path[i], world_path[i+1]
+    #     print(f"Segment {i}: dist={math.hypot(x2 - x1, z2 - z1):.3f}")
 
     # print("[DEBUG] First few world_path coords:")
     # for i, p in enumerate(world_path[:5]):

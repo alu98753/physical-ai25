@@ -85,3 +85,51 @@ plt.savefig("map.png", bbox_inches='tight', pad_inches=0)
 plt.show()
 
 print("2D semantic map saved as map.png")
+
+# ==========================================================
+# 步驟 4: 額外輸出 map_minmax.png
+# ==========================================================
+plt.figure(figsize=(10, 10))
+plt.scatter(
+    x_coords,
+    z_coords,
+    s=1,
+    c=filtered_colors,
+    marker='.'
+)
+plt.axis('equal')
+plt.axis('off')
+plt.title("2D Semantic Map (with min/max boundary)")
+
+# 取四個角點
+xmin, xmax = data["xmin"], data["xmax"]
+zmin, zmax = data["zmin"], data["zmax"]
+
+# 四個角的座標 (x, z)
+corner_points = [
+    (xmin, zmin),  # 左下
+    (xmin, zmax),  # 左上
+    (xmax, zmin),  # 右下
+    (xmax, zmax),  # 右上
+]
+
+# 畫出矩形邊界框
+plt.plot(
+    [xmin, xmin, xmax, xmax, xmin],
+    [zmin, zmax, zmax, zmin, zmin],
+    color="red",
+    linewidth=1.2,
+    label="Min-Max Bounds"
+)
+
+# 在角點上標記小紅點
+for (x, z) in corner_points:
+    plt.scatter(x, z, c='red', s=10)
+    plt.text(x, z, f"({x:.2f},{z:.2f})", color='red', fontsize=6)
+
+plt.legend()
+plt.savefig("map_minmax.png", bbox_inches='tight', pad_inches=0)
+plt.close()
+print("✅ map_minmax.png saved (with boundary box and coordinates)")
+
+plt.show()
