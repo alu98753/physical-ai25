@@ -206,12 +206,30 @@ def generate_actions_from_world_path(world_path_xz,
 # 導航與影片錄製
 # ==========================================================
 def overlay_mask(rgb, mask, color=(255, 0, 0), alpha=0.35):
-    out = rgb.copy()
-    color_layer = np.zeros_like(rgb)
-    color_layer[..., :] = color
-    blended = cv2.addWeighted(rgb, 1.0, color_layer, alpha, 0)
-    out[mask.astype(bool)] = blended[mask.astype(bool)]
-    return out
+    """
+    將 target mask 疊加到 RGB 影像上（半透明顏色）
+    color: RGB 顏色，例如 (255,0,0) 為紅色
+    alpha: 疊加透明度 (0~1)
+    """
+    # === Step 1. 確保尺寸一致 ===
+    if rgb.shape[:2] != mask.shape[:2]:
+        mask = cv2.resize(mask, (rgb.shape[1], rgb.shape[0]))
+
+    # === Step 2. 確保 mask 為二值 0/1 ===
+    if mask.dtype != np.uint8:
+        mask = (mask > 0).astype(np.uint8)
+    else:
+        mask = (mask > 0).astype(np.uint8)
+
+    # === Step 3. 建立彩色遮罩圖層 ===
+    color_mask = np.zeros_like(rgb, dtype=np.uint8)
+    color_mask[mask > 0] = color  # 只在 mask 區域上上色
+
+    # === Step 4. 混合圖像 ===
+    dst = cv2.addWeighted(color_mask, alpha, rgb, 1 - alpha, 0)
+
+    return dst
+
 
 def run_navigation(env, world_path, target_mask, output_video="result.mp4"):
     actions = generate_actions_from_world_path(world_path)
@@ -303,9 +321,13 @@ def run_navigation_replan(env, binary_map,safe_binary_map, color_map, bounds, st
                 # ======= 三種事件偵測 =======
                 if dist_to_goal < ARRIVAL_JUDGE:
                     print(f"[SUCCESS] Reached goal ✅ ({pos[0]:.2f}, {pos[2]:.2f})")
+                    rgb = obs["rgb"].copy()
+                    vis = end_anime(rgb)
+                    for _ in range(FPS * 3):
+                        vw.write(cv2.cvtColor(vis, cv2.COLOR_RGB2BGR))
+                        frame_count += 1
                     vw.release()
-                    print(f"[END] Navigation finished, {frame_count} frames saved.")
-
+                    print(f"[END] Navigation finished with ending screen, {frame_count} frames saved.")
                     return
                 move_dist = np.linalg.norm(pos - current_pos)
 
@@ -401,7 +423,19 @@ def run_navigation_replan(env, binary_map,safe_binary_map, color_map, bounds, st
     vw.release()
     print(f"[END] Navigation finished, {frame_count} frames saved.")
 
+def end_anime(rgb):
+    # === 結尾畫面 (居中文字 + 停留) ===
+    text = "Reached Goal"
+    font = cv2.FONT_HERSHEY_SIMPLEX
+    font_scale = 1.0
+    thickness = 2
+    text_size = cv2.getTextSize(text, font, font_scale, thickness)[0]
+    text_x = (rgb.shape[1] - text_size[0]) // 2
+    text_y = (rgb.shape[0] + text_size[1]) // 2
 
+    vis = rgb.copy()
+    cv2.putText(vis, text, (text_x, text_y), font, font_scale, (0, 255, 0), thickness, cv2.LINE_AA)
+    return vis
 
 # def run_navigation_replan(env, binary_map,safe_binary_map, color_map, bounds, start, goal, target_mask,
 #                         output_video="result_replan.mp4", replan_thresh=ARRIVAL_JUDGE*0.95):
@@ -691,7 +725,7 @@ if __name__ == "__main__":
 
     MAP_PATH = "/home/clu98753cs13/Desktop/course/phyai/physical-ai25/hw2/map.png"
     EXCEL_PATH = "/home/clu98753cs13/Desktop/course/phyai/physical-ai25/hw2/color_coding_semantic_segmentation_classes.xlsx"
-    TARGET_CLASS = "window"
+    TARGET_CLASS = "sofa"
     BOUNDS_PATH = "/home/clu98753cs13/Desktop/course/phyai/physical-ai25/hw2/coordinate_bounds.json"
     OUTPUT_PATH = "./part3OUTPUT"
     os.makedirs(OUTPUT_PATH, exist_ok=True)
@@ -699,8 +733,11 @@ if __name__ == "__main__":
     # === Part2 輸出接續 ===
     color_map = load_semantic_table(EXCEL_PATH)
     goal, mask = find_object_region(MAP_PATH, color_map, TARGET_CLASS)
-    start = (335, 240)
-    start = (236, 457) # test1: 直線行走左右有障礙 可能卡牆
+    start = (335, 240) # window test final: 要繞過椅子等 還要左右轉彎
+    start = (236, 457) # window test1: 直線行走左右有障礙 可能卡牆 pass
+    
+    start = (382, 256) # sofa test1: 直線走 pass
+    start = (212, 428) # base-cabinet test1: 直線走
 
     map_gray = cv2.imread(MAP_PATH, cv2.IMREAD_GRAYSCALE)
     _, binary = cv2.threshold(map_gray, 240, 255, cv2.THRESH_BINARY)
@@ -772,10 +809,15 @@ if __name__ == "__main__":
     # # ----------------------------------------------------------
 
     def target_mask(obs):
-        semantic_img = obs["semantic"]
-        target_rgb = np.array(color_map[TARGET_CLASS.lower()])[::-1]
+        semantic_img = obs["semantic"]  # RGB 格式
+        target_rgb = np.array(color_map[TARGET_CLASS.lower()])  # 保持原順序
+        print(f"[DEBUG] colormap (from excel): {color_map[TARGET_CLASS.lower()]}, used target_rgb: {target_rgb}")
         mask = cv2.inRange(semantic_img, target_rgb, target_rgb)
+        cv2.imwrite("debug_semantic_rgb.png", cv2.cvtColor(semantic_img, cv2.COLOR_RGB2BGR))
+        cv2.imwrite("debug_mask.png", mask * 255)
+
         return (mask > 0).astype(np.uint8)
+
 
     # === 導航 + 輸出 ===
     env = HabitatEnvWrapper(sim_settings)

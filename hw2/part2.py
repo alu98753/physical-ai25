@@ -189,6 +189,9 @@ def smooth_path(map_img, path, iterations=SMOOTH_ITER):
 # ==========================================================
 # RRT* 主算法（介面與舊 rrt_planning 相容）
 # ==========================================================
+# ==========================================================
+# RRT* 主算法（支援 goal 在障礙上 → 轉為最近空白點）
+# ==========================================================
 def rrt_star_planning(map_img, start, goal):
     """
     參數：
@@ -199,7 +202,8 @@ def rrt_star_planning(map_img, start, goal):
       - nodes: [Node, ...]（包含 parent/cost）
     """
     H, W = map_img.shape[:2]
-    # === ✅ 起點/終點合法性檢查 + 視覺化提示 (自動存圖) ===
+
+    # === ✅ 起點合法性檢查 ===
     if not is_free_pixel(map_img, start[0], start[1]):
         plt.figure(figsize=(8, 8))
         plt.imshow(map_img, cmap='gray')
@@ -208,61 +212,52 @@ def rrt_star_planning(map_img, start, goal):
         plt.title("⚠️ 起點落在障礙上 - 請重新選擇起點")
         plt.legend()
         plt.axis("equal")
-
-        # === 儲存圖像 ===
-        out_path = "start_on_obstacle.png"
-        plt.savefig(out_path, bbox_inches="tight", dpi=200)
-        print(f"❌ [警告] 起點在障礙上，已輸出偵錯圖像：{out_path}")
+        plt.savefig("start_on_obstacle.png", bbox_inches="tight", dpi=200)
         plt.close()
-
         raise ValueError("❌ 起點 (Start) 落在障礙區，請重新選擇位置。")
 
+    # === ✅ 目標檢查：允許在障礙上，但會自動修正 ===
     if not is_free_pixel(map_img, goal[0], goal[1]):
-        plt.figure(figsize=(8, 8))
+        print("⚠️ [提醒] 目標 (Goal) 位於障礙區，嘗試尋找最近可行走點 ...")
+        goal_old = goal
+        goal = find_safe_goal_along_line(map_img, start, goal, step=1, safe_radius=5)
+        print(f"✅ [修正] Goal: {goal_old} → {goal}")
+        if goal == goal_old:
+            print("❌ [警告] 找不到任何可行走點，將仍以原目標執行。")
+        else:
+            print(f"✅ [修正] 已將目標從 {goal_old} → {goal}")
         plt.imshow(map_img, cmap='gray')
-        plt.scatter(start[0], start[1], c='green', s=60, label='Start')
-        plt.scatter(goal[0], goal[1], c='red', s=80, label='Goal (在障礙上!)')
-        plt.title("⚠️ 目標落在障礙上 - 請檢查語意顏色或地圖設定")
+        plt.scatter(start[0], start[1], c='blue', label='Start')
+        plt.scatter(goal_old[0], goal_old[1], c='red', label='Original Goal')
+        plt.scatter(goal[0], goal[1], c='green', label='Safe Goal')
         plt.legend()
-        plt.axis("equal")
+        plt.axis('equal')
+        plt.savefig("debug_safe_goal_line.png", dpi=200)
 
-        # === 儲存圖像 ===
-        out_path = "goal_on_obstacle.png"
-        plt.savefig(out_path, bbox_inches="tight", dpi=200)
-        print(f"❌ [警告] 目標在障礙上，已輸出偵錯圖像：{out_path}")
-        plt.close()
-
-        raise ValueError("❌ 目標 (Goal) 落在障礙區，請確認語意分類或地圖。")
-
-
-
+    # === 初始化 ===
     rng = random.Random(12345)
-
     start_node = Node(start[0], start[1], parent=None, cost=0.0)
     nodes = [start_node]
     best_goal_node = None
     c_best = float("inf")
 
     for it in range(MAX_ITER):
-
-        # --- 取樣（含 goal bias 與 Informed 模式） ---
+        # --- 取樣 ---
         if rng.random() < GOAL_SAMPLE_RATE:
             sample = goal
         else:
-            # 若已有路徑且開啟 Informed，於橢圓區域取樣
             if INFORMED_SAMPLING and np.isfinite(c_best):
                 sample = sample_informed(start, goal, c_best, rng, (H, W))
                 if sample is None:
-                    # fallback uniform
                     sample = (rng.randrange(W), rng.randrange(H))
             else:
                 sample = (rng.randrange(W), rng.randrange(H))
 
-        # 無效點（障礙/越界）直接跳過
+        # 無效取樣直接跳過
         if not is_free_pixel(map_img, sample[0], sample[1]):
             continue
 
-        # --- 找最近點 + 延伸 ---
+        # --- 延伸 ---
         nearest_node = nearest(nodes, sample)
         new_node = steer(nearest_node, sample, STEP_SIZE)
         if new_node is None:
@@ -272,12 +267,10 @@ def rrt_star_planning(map_img, start, goal):
         if not line_collision_free(map_img, nearest_node.pt, new_node.pt):
             continue
 
-        # --- RRT*：挑成本最小的 parent（本地最佳連接） ---
+        # --- 選擇最佳 parent ---
         n = len(nodes)
-        radius = NEIGHBOR_COEFF * math.sqrt(max(math.log(n)/n, 1e-9))
+        radius = NEIGHBOR_COEFF * math.sqrt(max(math.log(n) / n, 1e-9))
         neighbors = near(nodes, new_node, radius) or [nearest_node]
-
-        # 先以最近的當 baseline
         best_parent = nearest_node
         best_cost = best_parent.cost + distance(best_parent.pt, new_node.pt)
 
@@ -291,7 +284,7 @@ def rrt_star_planning(map_img, start, goal):
         new_node.cost = best_cost
         nodes.append(new_node)
 
-        # --- RRT*：Rewire 附近節點（若經由 new_node 更短且可行，改其 parent） ---
+        # --- Rewire ---
         for nb in neighbors:
             if nb is new_node or nb is best_parent:
                 continue
@@ -300,19 +293,14 @@ def rrt_star_planning(map_img, start, goal):
                 nb.parent = new_node
                 nb.cost = new_cost
 
-        # --- 嘗試接通到 Goal（在距離門檻內且線段可行） ---
+        # --- 嘗試接通 Goal ---
         if distance(new_node.pt, goal) <= GOAL_REACH_THRESH:
             if line_collision_free(map_img, new_node.pt, goal):
                 goal_node = Node(goal[0], goal[1], parent=new_node,
                                  cost=new_node.cost + distance(new_node.pt, goal))
-                # 更新最佳解
                 if goal_node.cost < c_best:
                     best_goal_node = goal_node
                     c_best = goal_node.cost
-
-        #（可選）每隔一段輸出一次進度
-        # if it % 1000 == 0:
-        #     print(f"[{it}] nodes={len(nodes)} c_best={c_best:.1f}")
 
     # === 收尾 ===
     if best_goal_node is None:
@@ -322,6 +310,57 @@ def rrt_star_planning(map_img, start, goal):
     raw_path = extract_path(best_goal_node)
     smooth = smooth_path(map_img, raw_path, iterations=SMOOTH_ITER)
     return smooth, nodes
+
+
+# ==========================================================
+# 🔍 工具函式：找最近可行走點
+# ==========================================================
+def find_safe_goal_along_line(map_img, start, goal, step=1, safe_radius=5):
+    """
+    沿著 start→goal 連線尋找安全可行的 goal 替代點。
+    條件：
+      - 該點及其半徑 safe_radius 內皆為 free (255)
+    參數：
+      - map_img: 二值地圖 (0=障礙, 255=free)
+      - start, goal: (x, y)
+      - step: 沿線反向搜尋步長（像素）
+      - safe_radius: 檢查半徑（像素）
+    回傳：
+      - (x, y): 最近的安全 goal 點；若找不到，回傳原始 goal
+    """
+    gx, gy = goal
+    sx, sy = start
+    H, W = map_img.shape[:2]
+
+    # 計算連線方向（goal → start）
+    dx, dy = sx - gx, sy - gy
+    dist = math.hypot(dx, dy)
+    if dist == 0:
+        return goal
+    dx, dy = dx / dist, dy / dist  # 單位向量
+
+    def is_safe_point(x, y, r):
+        """檢查該點 r 半徑內是否全為 free"""
+        x, y = int(x), int(y)
+        for dy in range(-r, r + 1):
+            for dx in range(-r, r + 1):
+                nx, ny = x + dx, y + dy
+                if 0 <= nx < W and 0 <= ny < H:
+                    if map_img[ny, nx] < 128:
+                        return False
+                else:
+                    return False
+        return True
+
+    # 反向搜尋：從 goal 往 start 方向走
+    for t in np.arange(0, dist, step):
+        x = gx + dx * t
+        y = gy + dy * t
+        if is_safe_point(x, y, safe_radius):
+            return (int(x), int(y))
+
+    print("⚠️ [警告] 找不到沿線安全 goal，回傳原始 goal。")
+    return goal
 
 # ==========================================================
 # RRT 主演算法
@@ -476,8 +515,11 @@ if __name__ == "__main__":
         visualize_rrt(binary_map, nodes, start, goal, path)
         print(f"[INFO] 路徑長度（像素）: {path_length_px(path):.1f} | 節點數: {len(nodes)}")
         result_img = cv2.cvtColor(binary_map, cv2.COLOR_GRAY2BGR)
-        for i in range(len(path)-1):
-            cv2.line(result_img, path[i], path[i+1], (0, 0, 255), 2)
+        for i in range(len(path) - 1):
+            p1 = (int(path[i][0]), int(path[i][1]))
+            p2 = (int(path[i + 1][0]), int(path[i + 1][1]))
+            cv2.line(result_img, p1, p2, (0, 0, 255), 2)
+
         out = f"rrt_star_result_{target_class}.png"
         cv2.imwrite(out, result_img)
         print(f"[INFO] 結果已儲存至 {out}")
