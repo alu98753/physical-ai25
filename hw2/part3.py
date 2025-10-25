@@ -321,17 +321,11 @@ def run_navigation_replan(env, binary_map,safe_binary_map, color_map, bounds, st
                     f"dist_to_goal={dist_to_goal:.3f}, dist_to_path={dist_to_path:.3f}")
                 # ======= 三種事件偵測 =======
                 if dist_to_goal < ARRIVAL_JUDGE:
-                    print(f"[SUCCESS] Reached goal ✅ ({pos[0]:.2f}, {pos[2]:.2f})")
-                    rgb = obs["rgb"].copy()
-                    vis = end_anime(rgb)
-                    for _ in range(FPS * 3):
-                        vw.write(cv2.cvtColor(vis, cv2.COLOR_RGB2BGR))
-                        frame_count += 1
-                    vw.release()
-                    print(f"[END] Navigation finished with ending screen, {frame_count} frames saved.")
+                    # 結尾動畫
+                    face_goal(env, goal, bounds, w, h, vw, target_mask, FPS)
                     return
+                
                 move_dist = np.linalg.norm(pos - current_pos)
-
                 if dist_to_path > replan_thresh:
                     # print(f"[REPLAN] Deviated from path ({dist_to_path:.2f} m) → 重新規劃")
                     current_pos = pos.copy()
@@ -423,6 +417,68 @@ def run_navigation_replan(env, binary_map,safe_binary_map, color_map, bounds, st
 
     vw.release()
     print(f"[END] Navigation finished, {frame_count} frames saved.")
+
+def face_goal(env, goal, bounds, w, h, vw, target_mask, FPS=120, TURN_ANGLE=1):
+    """
+    當抵達目標後，慢慢旋轉面向指定 goal pixel 的世界座標，
+    並在結尾顯示目標 overlay 與「Reached Goal」畫面。
+    """
+    pos = env.agent.get_state().position.copy()
+    print(f"[SUCCESS] Reached goal ✅ ({pos[0]:.2f}, {pos[2]:.2f})")
+
+    # === 對準指定目標 pixel 的世界座標 ===
+    gx, gz = pixel_to_world(goal[0], goal[1], w, h, bounds)
+    dx, dz = gx - pos[0], gz - pos[2]
+    desired_yaw = math.atan2(-dx, -dz)
+
+    # 取目前 agent 的 yaw
+    q = env.agent.get_state().rotation
+    current_yaw = 2 * math.atan2(q.imag[1], q.real)
+
+    # 計算角度差
+    yaw_diff = wrap_to_pi(desired_yaw - current_yaw)
+    print(f"[TURN] current_yaw={math.degrees(current_yaw):.1f}°, desired_yaw={math.degrees(desired_yaw):.1f}°, diff={math.degrees(yaw_diff):.1f}°")
+
+    # 左為負 → turn_left
+    turn_action = "turn_left" if yaw_diff < 0 else "turn_right"
+    turn_steps = int(abs(math.degrees(yaw_diff)) // TURN_ANGLE)
+    print(f"[INFO] Turning {turn_steps} steps to face goal...")
+
+    if turn_steps > 0:
+        # === 有需要旋轉時 ===
+        for i in range(turn_steps):
+            obs = env.step(turn_action)
+            rgb = obs["rgb"]
+            mask = target_mask(obs)
+            vis = overlay_mask(rgb, mask)
+            # 控制轉動時每步的錄影幀數
+            for _ in range(FPS * 2 // max(turn_steps, 1)):
+                vw.write(cv2.cvtColor(vis, cv2.COLOR_RGB2BGR))
+    else:
+        # === 不需要旋轉時（保持目前畫面） ===
+        obs = env.step("turn_left")  # 小動作確保拿到新畫面
+        rgb = obs["rgb"]
+        mask = target_mask(obs)
+        vis = overlay_mask(rgb, mask)
+        for _ in range(FPS // 10):
+            vw.write(cv2.cvtColor(vis, cv2.COLOR_RGB2BGR))
+
+    # 再確認最終朝向
+    q2 = env.agent.get_state().rotation
+    final_yaw = 2 * math.atan2(q2.imag[1], q2.real)
+    print(f"[DONE] Final yaw aligned: {math.degrees(final_yaw):.1f}°")
+
+    # === 結尾畫面：保持面向目標並塗色 ===
+    rgb = obs["rgb"].copy()
+    mask = target_mask(obs)
+    vis = overlay_mask(rgb, mask)
+    vis = end_anime(vis)
+    for _ in range(FPS * 3):
+        vw.write(cv2.cvtColor(vis, cv2.COLOR_RGB2BGR))
+
+    vw.release()
+    print(f"[END] Navigation finished with facing target.")
+
 
 def end_anime(rgb):
     # === 結尾畫面 (居中文字 + 停留) ===
@@ -725,15 +781,13 @@ if __name__ == "__main__":
 
     MAP_PATH = "/home/clu98753cs13/Desktop/course/phyai/physical-ai25/hw2/map.png"
     EXCEL_PATH = "/home/clu98753cs13/Desktop/course/phyai/physical-ai25/hw2/color_coding_semantic_segmentation_classes.xlsx"
-    TARGET_CLASS = "sofa"
     BOUNDS_PATH = "/home/clu98753cs13/Desktop/course/phyai/physical-ai25/hw2/coordinate_bounds.json"
     OUTPUT_PATH = "./part3OUTPUT"
     os.makedirs(OUTPUT_PATH, exist_ok=True)
-
-    # === Part2 輸出接續 ===
     color_map = load_semantic_table(EXCEL_PATH)
     id_map = load_semantic_ID_table(EXCEL_PATH)
-
+    
+    TARGET_CLASS = "sofa"
     goal, mask = find_object_region(MAP_PATH, color_map, TARGET_CLASS)
     start = (335, 240) # window test final: 要繞過椅子等 還要左右轉彎
     start = (236, 457) # window test1: 直線行走左右有障礙 可能卡牆 pass
