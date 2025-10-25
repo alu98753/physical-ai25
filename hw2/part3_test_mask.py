@@ -1,36 +1,33 @@
-from __future__ import print_function
+import pandas as pd
+EXCEL_PATH = "/home/clu98753cs13/Desktop/course/phyai/physical-ai25/hw2/color_coding_semantic_segmentation_classes.xlsx"
 
-import cv2 as cv
+def load_semantic_ID_table(excel_path):
+    df = pd.read_excel(excel_path)
+    print(df.columns)
+    id_col = None
+    name_col = None
 
-alpha = 0.5
+    # 嘗試自動判斷欄位
+    for c in df.columns:
+        if c.strip().lower() in ["id", "class_id", "semantic_id", "label_id", "index"]:
+            id_col = c
+        elif c.strip().lower() in ["name", "class", "object", "label", "color name"]:
+            name_col = c
 
-try:
-    raw_input          # Python 2
-except NameError:
-    raw_input = input  # Python 3
+    if id_col is None or name_col is None:
+        raise ValueError(f"❌ 無法在 Excel 中找到 ID 或名稱欄位，檢查欄名：{list(df.columns)}")
 
-print(''' Simple Linear Blender
------------------------
-* Enter alpha [0.0-1.0]: ''')
-input_alpha = float(raw_input().strip())
-if 0 <= alpha <= 1:
-    alpha = input_alpha
-# [load]
-src1 = cv.imread(rf"/home/clu98753cs13/Desktop/course/phyai/physical-ai25/hw2/rrt_result.png")
-src2 = cv.imread(rf"/home/clu98753cs13/Desktop/course/phyai/physical-ai25/hw2/rrt_star_result_window.png")
-# [load]
-if src1 is None:
-    print("Error loading src1")
-    exit(-1)
-elif src2 is None:
-    print("Error loading src2")
-    exit(-1)
-# [blend_images]
-beta = (1.0 - alpha)
-dst = cv.addWeighted(src1, alpha, src2, beta, 0.0)
-# [blend_images]
-# [display]
-cv.imshow('dst', dst)
-cv.waitKey(0)
-# [display]
-cv.destroyAllWindows()
+    id_map = {}
+    for _, row in df.iterrows():
+        name = str(row[name_col]).strip().lower()
+        try:
+            id_val = int(row[id_col])
+        except ValueError:
+            continue
+        id_map[name] = id_val
+
+    print(f"[INFO] 成功載入 {len(id_map)} 個語意分類。")
+    return id_map
+
+id_map = load_semantic_ID_table(EXCEL_PATH)
+print(id_map)

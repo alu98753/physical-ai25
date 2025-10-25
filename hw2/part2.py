@@ -414,6 +414,7 @@ def load_semantic_table(excel_path):
         raise ValueError(f"❌ 無法在 Excel 中找到顏色或名稱欄位，檢查欄名：{list(df.columns)}")
     color_map = {}
     for _, row in df.iterrows():
+        id = row[0]
         name = str(row[name_col]).strip().lower()
         color_str = str(row[color_col]).strip()
         nums = [int(v) for v in color_str.replace("(", "").replace(")", "").split(",") if v.strip().isdigit()]
@@ -421,6 +422,31 @@ def load_semantic_table(excel_path):
             color_map[name] = tuple(nums)
     print(f"[INFO] 成功載入 {len(color_map)} 個語意分類。")
     return color_map
+
+def load_semantic_ID_table(excel_path):
+    df = pd.read_excel(excel_path)
+
+    id_col = df.columns[0]  # 假設 ID 在第 0 欄
+    name_col = None
+
+    # 找出名稱欄
+    for c in df.columns:
+        if c.strip().lower() in ["name", "class", "object", "color", "color name"]:
+            name_col = c
+
+    if name_col is None:
+        raise ValueError(f"❌ 無法在 Excel 中找到名稱欄位，檢查欄名：{list(df.columns)}")
+
+    id_map = {}
+    for _, row in df.iterrows():
+        obj_id = int(row[id_col]) if not pd.isna(row[id_col]) else None
+        name = str(row[name_col]).strip().lower()
+        if obj_id is not None and name:
+            id_map[name] = obj_id
+
+    print(f"[INFO] 成功載入 {len(id_map)} 個語意分類。")
+    return id_map
+
 
 def find_object_region(map_path, color_map, target_class):
     img = cv2.imread(map_path)
@@ -484,6 +510,7 @@ if __name__ == "__main__":
 
     # Step 1. 載入語意表與地圖
     color_map = load_semantic_table(EXCEL_PATH)
+    id_map = load_semantic_ID_table(EXCEL_PATH)
     map_img = cv2.imread(MAP_PATH)
     if map_img is None:
         raise FileNotFoundError(f"❌ 找不到地圖: {MAP_PATH}")

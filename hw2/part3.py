@@ -4,9 +4,10 @@ import math
 import json
 import numpy as np
 import habitat_sim
-from habitat_sim.utils.common import d3_40_colors_rgb
+from habitat_sim.utils.common import d3_40_colors_rgb,d3_40_colors_hex
 from PIL import Image
 import matplotlib.pyplot as plt
+from part2 import rrt_star_planning, load_semantic_ID_table ,  load_semantic_table, find_object_region , rrt_star_planning
 
 # ==========================================================
 # Habitat 環境封裝
@@ -205,7 +206,7 @@ def generate_actions_from_world_path(world_path_xz,
 # ==========================================================
 # 導航與影片錄製
 # ==========================================================
-def overlay_mask(rgb, mask, color=(255, 0, 0), alpha=0.35):
+def overlay_mask(rgb, mask, color=(255, 0, 0), alpha=0.15):
     """
     將 target mask 疊加到 RGB 影像上（半透明顏色）
     color: RGB 顏色，例如 (255,0,0) 為紅色
@@ -721,7 +722,6 @@ if __name__ == "__main__":
     
     print("=== HW2 Part3 (Safe Final Version) ===")
 
-    from part2 import rrt_star_planning, load_semantic_table, find_object_region , rrt_star_planning
 
     MAP_PATH = "/home/clu98753cs13/Desktop/course/phyai/physical-ai25/hw2/map.png"
     EXCEL_PATH = "/home/clu98753cs13/Desktop/course/phyai/physical-ai25/hw2/color_coding_semantic_segmentation_classes.xlsx"
@@ -732,12 +732,14 @@ if __name__ == "__main__":
 
     # === Part2 輸出接續 ===
     color_map = load_semantic_table(EXCEL_PATH)
+    id_map = load_semantic_ID_table(EXCEL_PATH)
+
     goal, mask = find_object_region(MAP_PATH, color_map, TARGET_CLASS)
     start = (335, 240) # window test final: 要繞過椅子等 還要左右轉彎
     start = (236, 457) # window test1: 直線行走左右有障礙 可能卡牆 pass
     
     start = (382, 256) # sofa test1: 直線走 pass
-    start = (212, 428) # base-cabinet test1: 直線走
+    # start = (212, 428) # base-cabinet test1: 直線走
 
     map_gray = cv2.imread(MAP_PATH, cv2.IMREAD_GRAYSCALE)
     _, binary = cv2.threshold(map_gray, 240, 255, cv2.THRESH_BINARY)
@@ -807,14 +809,25 @@ if __name__ == "__main__":
     # vw.release()
     # print("[DEBUG] smoke test video saved as smoke_forward_test.mp4")
     # # ----------------------------------------------------------
+    def hex_to_rgb(hex_color):
+        """支援 '#', '0x' 等格式的 hex → (R, G, B)"""
+        hex_color = hex_color.strip().lower().replace('0x', '').replace('#', '')
+        if len(hex_color) != 6:
+            raise ValueError(f"❌ 無效的 hex 色碼: {hex_color}")
+        return tuple(int(hex_color[i:i+2], 16) for i in (0, 2, 4))
+
 
     def target_mask(obs):
         semantic_img = obs["semantic"]  # RGB 格式
-        target_rgb = np.array(color_map[TARGET_CLASS.lower()])  # 保持原順序
+        target_id = id_map[TARGET_CLASS.lower()] % 40
+        target_rgb = hex_to_rgb(d3_40_colors_hex[target_id])
+        
         print(f"[DEBUG] colormap (from excel): {color_map[TARGET_CLASS.lower()]}, used target_rgb: {target_rgb}")
         mask = cv2.inRange(semantic_img, target_rgb, target_rgb)
+        print(f"[DEBUG] mask pixels: {np.sum(mask > 0)}")  # 看有沒有非0像素
+
         cv2.imwrite("debug_semantic_rgb.png", cv2.cvtColor(semantic_img, cv2.COLOR_RGB2BGR))
-        cv2.imwrite("debug_mask.png", mask * 255)
+        cv2.imwrite("debug_mask.png", mask )
 
         return (mask > 0).astype(np.uint8)
 
@@ -826,7 +839,6 @@ if __name__ == "__main__":
     
     # TODO: 2.set init position 
     start_x, start_z = pixel_to_world(start[0], start[1], w, h, bounds)
-    # start_x, start_z = start_x * 40, start_z * 40   # 若你有 global scaling
     print(f"[INFO] Start world coord: ({start_x:.3f}, {start_z:.3f})")
     state = habitat_sim.AgentState()
     state.position = np.array([start_x, 0, start_z])  # y=高度 =0
