@@ -6,9 +6,9 @@ import random
 import math
 from collections import deque
 import os
-import scipy
-from scipy.spatial import KDTree
-
+# import scipy
+# from scipy.spatial import KDTree
+from rtree import index
 # ==========================================================
 # 路徑設定
 # ==========================================================
@@ -21,7 +21,7 @@ EXCEL_PATH = os.path.join(
 # RRT* 參數（像素座標系）
 # ==========================================================
 STEP_SIZE = 5      # 每次延伸步長（px）
-MAX_ITER = 40000     # 迭代上限
+MAX_ITER = 10000     # 迭代上限
 GOAL_SAMPLE_RATE = 0.25     # 目標偏置機率
 NEIGHBOR_COEFF = 60.0     # 鄰居半徑係數 (r = coeff * sqrt(log(n)/n))
 SMOOTH_ITER = 5      # 路徑平滑化嘗試次數
@@ -162,39 +162,42 @@ def path_length_px(path):
 # ==========================================================
 # Informed 取樣（在已知最佳路徑長 c_best 後，於包含 start/goal 的橢圓內取樣）
 # ==========================================================
-
-
-def sample_informed(start, goal, c_best, rng, map_shape):
+def sample_informed(start, goal, c_best, rng, map_shape, labels, start_label):
     # 若 c_best 無限大，回傳 None 代表退回 uniform
     c_min = distance(start, goal)
     if not np.isfinite(c_best) or c_best <= c_min + 1e-6:
         return None
 
-    # 橢圓參數
-    a = c_best / 2.0       # 橢圓長半軸
-    b = math.sqrt(max(a*a - (c_min/2.0)**2, 1e-6))  # 短半軸
-    # 旋轉角（start→goal）
+    # 橢圓參數 ( ... 保持不變 ... )
+    a = c_best / 2.0
+    b = math.sqrt(max(a*a - (c_min/2.0)**2, 1e-6))
     theta = math.atan2(goal[1]-start[1], goal[0]-start[0])
 
-    # 在單位圓內取樣，再放縮成橢圓
+    # 在單位圓內取樣 ( ... 保持不變 ... )
     r = math.sqrt(rng.random())
     ang = 2*math.pi*rng.random()
     x_e = r * math.cos(ang) * a
     y_e = r * math.sin(ang) * b
 
-    # 旋轉 & 平移到世界座標（像素）
+    # 旋轉 & 平移 ( ... 保持不變 ... )
     c = math.cos(theta)
     s = math.sin(theta)
     x = x_e * c - y_e * s + (start[0] + goal[0]) / 2.0
     y = x_e * s + y_e * c + (start[1] + goal[1]) / 2.0
 
-    # 保底：若落在障礙或越界就返回 None（外層會改用 uniform）
+    # ✅ 【修改】: 檢查點的有效性
     x_i, y_i = int(round(x)), int(round(y))
     H, W = map_shape
-    if 0 <= x_i < W and 0 <= y_i < H:
-        return (x_i, y_i)
-    return None
 
+    # 必須同時滿足：
+    # 1. 在地圖邊界內
+    # 2. 落在我們關心的 'start_label' 連通區域 (隱含了不在障礙物上)
+    if 0 <= x_i < W and 0 <= y_i < H:
+        if labels[y_i, x_i] == start_label:
+            return (x_i, y_i)
+
+    # 否則 (越界、在障礙物上、在其他連通區)，返回 None
+    return None
 # ==========================================================
 # 路徑平滑化（Shortcut smoothing）
 # ==========================================================
@@ -306,10 +309,12 @@ def get_safety_penalty(point, goal_point, dist_map, SAFE_WEIGHT, GOAL_SAFETY_EXE
 def rrt_star_planning(map_img, start, goal, dist_map=None, SAFE_WEIGHT=10000.0, D_SAFE_MAX_FOR_SAMPLING=1.0):
     """
     改良版 RRT*：使用統一的倒數平方懲罰推離牆面。
+    ✅ 使用 R-Tree 取代 KD-Tree 以實現 $O(\log N)$ 增量更新
     """
     H, W = map_img.shape[:2]
 
     # === (起點/目標點檢查 ... 保持不變) ===
+    # ... (此處代碼不變)
     if not (0 <= start[0] < W and 0 <= start[1] < H) or map_img[int(start[1]), int(start[0])] < 128 \
             or not is_safe_point(map_img, start[0], start[1], r=5):
         print("⚠️ [提醒] 起點在障礙/不安全，尋找最近安全點 ...")
@@ -326,71 +331,119 @@ def rrt_star_planning(map_img, start, goal, dist_map=None, SAFE_WEIGHT=10000.0, 
             map_img, start, goal, step=1, safe_radius=5)
         print(f"✅ [修正] Goal: {goal_old} → {goal}")
     # =====================================
+    print("[INFO] 正在計算可行走區域的連通元件...")
+    # map_img 是二值化地圖 (0=障礙, 255=可行走)
+    num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(map_img, 8, cv2.CV_32S)
+    
+    # 獲取修正後的 start/goal 所在的區域標籤
+    # 注意：labels 的索引是 (y, x)
+    start_label = labels[int(start[1]), int(start[0])]
+    goal_label = labels[int(goal[1]), int(goal[0])]
+    # 檢查：
+    # 1. start/goal 是否落在障礙物上 (label=0) (雖然前面修正過，但 double check)
+    # 2. start/goal 是否在不同的連通區域 (無法到達)
+    if start_label == 0:
+        print(f"❌ 錯誤：修正後的起點 {start} 位於障礙物標籤 (label=0)。")
+        return None, []
+    if goal_label == 0:
+        print(f"❌ 錯誤：修正後的目標 {goal} 位於障礙物標籤 (label=0)。")
+        return None, []
+    if start_label != goal_label:
+        print(
+            f"❌ 錯誤：起點 (區域 {start_label}) 和目標 (區域 {goal_label}) 位於不同的連通區域，路徑不存在。")
+        return None, []
 
+    print(f"[INFO] Start/Goal 均位於連通區域 {start_label}。")
+    # 建立一個只包含 'start_label' 區域的遮罩 (Mask)
+    sampling_mask = np.uint8(labels == start_label) * 255
+
+    # 從遮罩中找出所有可行走點的座標 (x, y)
+    # free_coords 是一個 (N, 1, 2) 的陣列, 格式為 (x, y)
+    free_coords_cv = cv2.findNonZero(sampling_mask)
+
+    if free_coords_cv is None:
+        print(f"❌ 錯誤：在區域 {start_label} 中找不到任何可行走點。")
+        return None, []
+
+    # 將 (N, 1, 2) 轉換為 (N, 2) 以便快速索引
+    free_coords = free_coords_cv.squeeze(1)
+    print(f"[INFO] 已快取 {len(free_coords)} 個有效取樣點。")
     # === 初始化 ===
     rng = random.Random(12345)
     start_node = Node(start[0], start[1], parent=None, cost=0.0)
-    nodes = [start_node]
+    nodes = [start_node]  # 我們仍然需要 list 來儲存 Node 物件
     best_goal_node = None
     c_best = float("inf")
 
+    # ✅ 【優化】: 初始化 R-Tree
+    # R-Tree 儲存 (id, (x, y, x, y), object)
+    # 這裡的 id 我們直接用 node 在 'nodes' list 中的索引 (index)
+    p = index.Property()
+    p.dimension = 2
+    # 建立 R-Tree 索引。R-Tree 中的 'id' 對應 'nodes' list 的索引
+    rtree = index.Index(properties=p)
+    # 插入起點 (id=0)
+    rtree.insert(0, (start_node.x, start_node.y, start_node.x, start_node.y))
+
     # (參數) 靠近目標多近時 (px)，停止計算安全懲罰
     GOAL_SAFETY_EXEMPT_DIST = 40.0
-    MIN_SAFE_DIST = 8.0  # 絕對最小安全距離（像素） <--- 新增此變量
-    
+    MIN_SAFE_DIST = 8.0  # 絕對最小安全距離（像素）
+
     for it in range(MAX_ITER):
+        is_goal_sample = False
+        sample = None
+        
         # --- (取樣 ... 保持不變) ---
         if rng.random() < GOAL_SAMPLE_RATE:
             sample = goal
             if not is_free_pixel(map_img, sample[0], sample[1]):
                 continue
+            is_goal_sample = True
         else:
             if INFORMED_SAMPLING and np.isfinite(c_best):
-                sample = sample_informed(start, goal, c_best, rng, (H, W))
-                if sample is None:
-                    sample = (rng.randrange(W), rng.randrange(H))
+                sample = sample_informed(
+                    start, goal, c_best, rng, (H, W), labels, start_label)
             else:
-                sample = (rng.randrange(W), rng.randrange(H))
+                rand_idx = rng.randint(0, len(free_coords) - 1)
+                sample = tuple(free_coords[rand_idx])
 
+            if sample is None:
+                continue
             if not is_free_pixel(map_img, sample[0], sample[1]):
                 continue
 
-        # --- (延伸/安全採樣檢查 ... 保持不變) ---
-        nearest_node = nearest(nodes, sample)
+        # --- (延伸/安全採樣檢查 ... ) ---
 
+        # ✅ 【修改】: 使用 R-Tree 查詢最近鄰 (Nearest)
+        # R-Tree 查詢點 (x, y) 必須提供 bounding box (x, y, x, y)
+        # 查詢返回的是 generator，用 next() 取第一個 (k=1)
+        # R-Tree.nearest 返回的是 id (即 'nodes' list 的索引)
+        try:
+            nearest_id = next(rtree.nearest(
+                (sample[0], sample[1], sample[0], sample[1]), 1))
+            nearest_node = nodes[nearest_id]
+        except StopIteration:
+            continue  # R-Tree 為空？ (理論上不會發生)
 
-        if dist_map is not None:
+        # ... (安全檢查邏輯 ... 保持不變)
+        if dist_map is not None and not is_goal_sample:
             iy = int(np.clip(sample[1], 0, dist_map.shape[0]-1))
             ix = int(np.clip(sample[0], 0, dist_map.shape[1]-1))
             d_safe_sample = dist_map[iy, ix]
 
-            # 絕對最小距離檢查：如果採樣點太貼牆，立即拒絕
-            if d_safe_sample < MIN_SAFE_DIST:
-                  continue
-
-            # 2. 局部貼牆拒絕（修正後的扇形邏輯）
-            # 計算從 nearest_node 指向 sample 的方向
+            # if d_safe_sample < MIN_SAFE_DIST:
+            #     continue
             heading = math.atan2(
                 sample[1] - nearest_node.y, sample[0] - nearest_node.x)
-
-            # 獲取前方扇形區域的安全距離分佈
             sector_vals = get_sector_distances(dist_map, (nearest_node.x, nearest_node.y),
-                                              heading_rad=heading, fov_deg=150, radius=25)
-
+                                               heading_rad=heading, fov_deg=150, radius=25)
             if len(sector_vals) > 10:
-                # 找出 "最貼牆的 75% 距離" 的上限
-                # 亦即：將所有距離由小到大排列，取第 75% 的值。
-                # 距離越小代表越貼牆。
-                # 如果這個值（d_safe_Q3）很小，表示這個區域整體都很貼牆。
                 d_safe_Q3 = np.percentile(sector_vals, 25)
             else:
                 d_safe_Q3 = D_SAFE_MAX_FOR_SAMPLING
-
-            # 修正邏輯：如果採樣點的安全距離 d_safe_sample 落在
-            # 扇形區域內 "最貼牆的 75% 距離" 範圍內，則拒絕。
-            # 換句話說，只接受 d_safe_sample 位於 d_safe_Q3 以外（更寬敞）的採樣。
             if d_safe_sample <= d_safe_Q3:
                 continue
+        # ... (安全檢查結束)
 
         new_node = steer(nearest_node, sample, STEP_SIZE)
         if new_node is None:
@@ -399,15 +452,38 @@ def rrt_star_planning(map_img, start, goal, dist_map=None, SAFE_WEIGHT=10000.0, 
             continue
         if not line_collision_free(map_img, nearest_node.pt, new_node.pt):
             continue
-        # ---------------------------
 
+        # ---------------------------
+        if dist_map is not None:
+            # 獲取 new_node 的安全距離
+            iy = int(np.clip(new_node.y, 0, dist_map.shape[0]-1))
+            ix = int(np.clip(new_node.x, 0, dist_map.shape[1]-1))
+            d_safe_new_node = dist_map[iy, ix]
+
+            # 獲取 new_node 到目標的距離
+            dist_to_goal = distance(new_node.pt, goal)
+
+            # 僅在離目標一定距離外 (e.g. > 40px) 才強制執行絕對安全距離
+            # 允許在接近目標時 (e.g. < 40px) 稍微貼牆
+            if dist_to_goal > GOAL_SAFETY_EXEMPT_DIST:
+                if d_safe_new_node < MIN_SAFE_DIST:
+                            continue
         new_node_penalty = get_safety_penalty(
             new_node.pt, goal, dist_map, SAFE_WEIGHT, GOAL_SAFETY_EXEMPT_DIST)
-        
+
         # --- 選擇最佳 parent (Choose Parent) ---
         n = len(nodes)
         radius = NEIGHBOR_COEFF * math.sqrt(max(math.log(n) / n, 1e-9))
-        neighbors = near(nodes, new_node, radius) or [nearest_node]
+
+        # ✅ 【修改】: 使用 R-Tree 查詢鄰居 (Near / Ball Query)
+        # R-Tree 範圍查詢 (intersection) 需要 Bounding Box
+        bounds = (
+            new_node.x - radius, new_node.y - radius,
+            new_node.x + radius, new_node.y + radius
+        )
+        # R-Tree.intersection 返回 id 的 generator
+        indices = list(rtree.intersection(bounds))
+        neighbors = [nodes[i] for i in indices]
 
         # 計算初始最佳成本 (parent: nearest_node)
         best_parent = nearest_node
@@ -417,13 +493,9 @@ def rrt_star_planning(map_img, start, goal, dist_map=None, SAFE_WEIGHT=10000.0, 
         best_cost = best_parent.cost + best_edge_cost
 
         for nb in neighbors:
-            # 1. 計算幾何邊緣成本
+            # ... (Choose Parent 邏輯 ... 保持不變)
             geometric_edge_cost = distance(nb.pt, new_node.pt)
-
-            # 2. 總成本 = nb.cost + 幾何邊緣成本 + new_node 的懲罰
             cand_cost = nb.cost + geometric_edge_cost + new_node_penalty
-
-            # 3. 檢查是否有更好的 parent
             if cand_cost + 1e-6 < best_cost and line_collision_free(map_img, nb.pt, new_node.pt):
                 best_parent = nb
                 best_cost = cand_cost
@@ -431,28 +503,31 @@ def rrt_star_planning(map_img, start, goal, dist_map=None, SAFE_WEIGHT=10000.0, 
         # === 新節點加入 ===
         new_node.parent = best_parent
         new_node.cost = best_cost
-        nodes.append(new_node)
 
+        # ✅ 【修改】: 增量更新 R-Tree
+        # 1. 先將新節點加入 'nodes' list
+        nodes.append(new_node)
+        # 2. 獲取新節點的索引 (id)
+        new_node_id = len(nodes) - 1
+        # 3. 將 (id, bounds) 插入 R-Tree
+        rtree.insert(new_node_id, (new_node.x,
+                     new_node.y, new_node.x, new_node.y))
+
+        # ❌ 【移除】: 刪除 vstack 和 KDTree 重建
+        # node_coords = np.vstack([node_coords, new_node.pt])
+        # kdtree = KDTree(node_coords)
 
         # --- Rewire ---
         for nb in neighbors:
             if nb is new_node or nb is best_parent:
-                  continue
+                continue
 
-            # 1. 計算幾何邊緣成本 (new_node -> nb)
+            # ... (Rewire 邏輯 ... 保持不變)
             geometric_edge_cost = distance(new_node.pt, nb.pt)
-
-            # 2. ✅【優化 1】: 計算鄰居 (nb) 的懲罰
             nb_penalty = get_safety_penalty(
                 nb.pt, goal, dist_map, SAFE_WEIGHT, GOAL_SAFETY_EXEMPT_DIST)
-
-            # 3. 邊緣成本 = 幾何距離 + nb 的懲罰
             segment_cost = geometric_edge_cost + nb_penalty
-
-            # 4. 計算新的總成本
             new_cost = new_node.cost + segment_cost
-
-            # 5. 比較成本並更新
             if new_cost + 1e-6 < nb.cost and line_collision_free(map_img, new_node.pt, nb.pt):
                 nb.parent = new_node
                 nb.cost = new_cost
@@ -460,10 +535,7 @@ def rrt_star_planning(map_img, start, goal, dist_map=None, SAFE_WEIGHT=10000.0, 
         # --- (嘗試接通 Goal ... 保持不變) ---
         if distance(new_node.pt, goal) <= GOAL_REACH_THRESH:
             if line_collision_free(map_img, new_node.pt, goal):
-
-                # 抵達 Goal 時，不計算安全懲罰，只用距離
                 final_cost = new_node.cost + distance(new_node.pt, goal)
-
                 goal_node = Node(goal[0], goal[1],
                                 parent=new_node, cost=final_cost)
                 if goal_node.cost < c_best:

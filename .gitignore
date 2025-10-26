@@ -9,3 +9,9 @@ data_collection/
 *.mp4
 
 __pyc*/
+
+*.glb
+*.navmesh
+git_acc*.txt
+
+*test-scenes

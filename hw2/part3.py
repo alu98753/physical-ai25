@@ -778,10 +778,10 @@ if __name__ == "__main__":
     
     print("=== HW2 Part3 (Safe Final Version) ===")
 
-
-    MAP_PATH = "/home/clu98753cs13/Desktop/course/phyai/physical-ai25/hw2/map.png"
-    EXCEL_PATH = "/home/clu98753cs13/Desktop/course/phyai/physical-ai25/hw2/color_coding_semantic_segmentation_classes.xlsx"
-    BOUNDS_PATH = "/home/clu98753cs13/Desktop/course/phyai/physical-ai25/hw2/coordinate_bounds.json"
+    currdir = os.path.dirname(os.path.abspath(__file__))
+    MAP_PATH = os.path.join(currdir, "map.png")
+    EXCEL_PATH = os.path.join(currdir, "color_coding_semantic_segmentation_classes.xlsx")
+    BOUNDS_PATH = os.path.join(currdir, "coordinate_bounds.json")
     OUTPUT_PATH = "./part3OUTPUT"
     os.makedirs(OUTPUT_PATH, exist_ok=True)
     color_map = load_semantic_table(EXCEL_PATH)
