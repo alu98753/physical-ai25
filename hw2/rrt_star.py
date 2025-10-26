@@ -6,7 +6,8 @@ import random
 import math
 from collections import deque
 import os
-
+import scipy
+from scipy.spatial import KDTree
 
 # ==========================================================
 # 路徑設定
@@ -275,6 +276,30 @@ def calculate_edge_cost(parent_node, child_point, goal_point, dist_map, SAFE_WEI
     return geometric_cost + safety_penalty
 
 
+# ============
+# Speed up
+###########
+
+def get_safety_penalty(point, goal_point, dist_map, SAFE_WEIGHT, GOAL_SAFETY_EXEMPT_DIST):
+    """計算指定點的安全懲罰項 (不包含幾何距離)"""
+    safety_penalty = 0.0
+    if dist_map is not None:
+        # 獲取點的安全距離
+        iy = int(np.clip(point[1], 0, dist_map.shape[0]-1))
+        ix = int(np.clip(point[0], 0, dist_map.shape[1]-1))
+        d_safe = float(dist_map[iy, ix])
+
+        # 獲取點到目標的距離
+        dist_to_goal = distance(point, goal_point)
+
+        # 僅在離目標一定距離外計算懲罰
+        if dist_to_goal > GOAL_SAFETY_EXEMPT_DIST:
+            # 統一使用倒數平方懲罰
+            safety_penalty = SAFE_WEIGHT / ((d_safe + 1e-3) ** 2)
+
+    return safety_penalty
+  
+
 # ==========================================================
 # RRT* 主算法
 # ==========================================================
@@ -376,25 +401,29 @@ def rrt_star_planning(map_img, start, goal, dist_map=None, SAFE_WEIGHT=10000.0, 
             continue
         # ---------------------------
 
+        new_node_penalty = get_safety_penalty(
+            new_node.pt, goal, dist_map, SAFE_WEIGHT, GOAL_SAFETY_EXEMPT_DIST)
+        
         # --- 選擇最佳 parent (Choose Parent) ---
         n = len(nodes)
         radius = NEIGHBOR_COEFF * math.sqrt(max(math.log(n) / n, 1e-9))
         neighbors = near(nodes, new_node, radius) or [nearest_node]
 
-        # 使用工具函數計算初始最佳成本
+        # 計算初始最佳成本 (parent: nearest_node)
         best_parent = nearest_node
-        best_edge_cost = calculate_edge_cost(
-            best_parent, new_node.pt, goal, dist_map, SAFE_WEIGHT, GOAL_SAFETY_EXEMPT_DIST)
+        # 邊緣成本 = 幾何距離 + new_node 的懲罰
+        best_edge_cost = distance(
+            best_parent.pt, new_node.pt) + new_node_penalty
         best_cost = best_parent.cost + best_edge_cost
 
         for nb in neighbors:
+            # 1. 計算幾何邊緣成本
+            geometric_edge_cost = distance(nb.pt, new_node.pt)
 
-            # 1. 計算新的邊緣成本 (含安全懲罰)
-            cand_edge_cost = calculate_edge_cost(
-                nb, new_node.pt, goal, dist_map, SAFE_WEIGHT, GOAL_SAFETY_EXEMPT_DIST)
-            cand_cost = nb.cost + cand_edge_cost
+            # 2. 總成本 = nb.cost + 幾何邊緣成本 + new_node 的懲罰
+            cand_cost = nb.cost + geometric_edge_cost + new_node_penalty
 
-            # 2. 檢查是否有更好的 parent
+            # 3. 檢查是否有更好的 parent
             if cand_cost + 1e-6 < best_cost and line_collision_free(map_img, nb.pt, new_node.pt):
                 best_parent = nb
                 best_cost = cand_cost
@@ -404,20 +433,26 @@ def rrt_star_planning(map_img, start, goal, dist_map=None, SAFE_WEIGHT=10000.0, 
         new_node.cost = best_cost
         nodes.append(new_node)
 
+
         # --- Rewire ---
         for nb in neighbors:
             if nb is new_node or nb is best_parent:
-                continue
+                  continue
 
-            # 1. 計算新的邊緣成本 (new_node -> nb)
-            # ⚠️ 注意：此時 new_node 是 parent，nb 是 child，懲罰計算基於 child (nb)
-            segment_cost = calculate_edge_cost(
-                new_node, nb.pt, goal, dist_map, SAFE_WEIGHT, GOAL_SAFETY_EXEMPT_DIST)
+            # 1. 計算幾何邊緣成本 (new_node -> nb)
+            geometric_edge_cost = distance(new_node.pt, nb.pt)
 
-            # 2. 計算新的總成本
+            # 2. ✅【優化 1】: 計算鄰居 (nb) 的懲罰
+            nb_penalty = get_safety_penalty(
+                nb.pt, goal, dist_map, SAFE_WEIGHT, GOAL_SAFETY_EXEMPT_DIST)
+
+            # 3. 邊緣成本 = 幾何距離 + nb 的懲罰
+            segment_cost = geometric_edge_cost + nb_penalty
+
+            # 4. 計算新的總成本
             new_cost = new_node.cost + segment_cost
 
-            # 3. 比較成本並更新
+            # 5. 比較成本並更新
             if new_cost + 1e-6 < nb.cost and line_collision_free(map_img, new_node.pt, nb.pt):
                 nb.parent = new_node
                 nb.cost = new_cost
@@ -430,7 +465,7 @@ def rrt_star_planning(map_img, start, goal, dist_map=None, SAFE_WEIGHT=10000.0, 
                 final_cost = new_node.cost + distance(new_node.pt, goal)
 
                 goal_node = Node(goal[0], goal[1],
-                                 parent=new_node, cost=final_cost)
+                                parent=new_node, cost=final_cost)
                 if goal_node.cost < c_best:
                     best_goal_node = goal_node
                     c_best = goal_node.cost
@@ -442,18 +477,14 @@ def rrt_star_planning(map_img, start, goal, dist_map=None, SAFE_WEIGHT=10000.0, 
         return None, nodes
 
     raw_path = extract_path(best_goal_node)
-
-    # ✅ 啟用平滑化
+    # 啟用平滑化
     raw_path = smooth_path(map_img, raw_path, iterations=SMOOTH_ITER)
 
-    # ⚠️ 回傳平滑化後的 path
     return raw_path, nodes
 
 # ==========================================================
 # 🔍 工具函式：找最近可行走點 (保持不變)
 # ==========================================================
-
-
 def is_safe_point(map_img, x, y, r=5):
     """
     該點 (x,y) 及其以 r 為半徑的方形鄰域是否全為 free(>=128)。
