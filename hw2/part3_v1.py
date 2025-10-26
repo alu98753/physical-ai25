@@ -7,7 +7,8 @@ import habitat_sim
 from habitat_sim.utils.common import d3_40_colors_rgb,d3_40_colors_hex
 from PIL import Image
 import matplotlib.pyplot as plt
-from part2 import rrt_star_planning, load_semantic_ID_table ,  load_semantic_table, find_object_region , rrt_star_planning
+from part2 import load_semantic_ID_table ,  load_semantic_table, find_object_region
+from rrt_star import rrt_star_planning
 
 # ==========================================================
 # Habitat 環境封裝
@@ -146,6 +147,7 @@ def world_to_pixel(x, z, w, h, bounds):
 
 def wrap_to_pi(a): return (a + math.pi) % (2 * math.pi) - math.pi
 
+
 def generate_actions_from_world_path(world_path_xz,
                                     current_yaw_rad = 0.0,
                                     forward_step_m=FORWARD_STEP,
@@ -159,15 +161,26 @@ def generate_actions_from_world_path(world_path_xz,
         nonlocal yaw
         step = math.radians(turn_step_deg)
         d = wrap_to_pi(desired_yaw - yaw)
-        if abs(d) > math.radians(5):  # 放寬閾值
-            if d > 0:
-                actions.append("turn_left")
-                yaw += step
-            else:
-                actions.append("turn_right")
-                yaw -= step
-        # 不要無限迴圈，避免震盪
-        # print(f"[turn] desired={math.degrees(desired_yaw):.1f}, curr={math.degrees(yaw):.1f}, diff={math.degrees(d):.1f}")
+        angle_deg = math.degrees(abs(d))
+
+        # 若角度太小，就不轉（防止左右切換）
+        if angle_deg < 2:
+            return
+
+        # 大角度先快速轉，小角度平滑
+        if angle_deg > 15:
+            step_mult = 1.0
+        elif angle_deg > 5:
+            step_mult = 0.5
+        else:
+            step_mult = 0.25
+
+        if d > 0:
+            actions.append("turn_left")
+            yaw += step * step_mult
+        else:
+            actions.append("turn_right")
+            yaw -= step * step_mult
 
 
     def forward_to(tx, tz):
@@ -202,6 +215,7 @@ def generate_actions_from_world_path(world_path_xz,
     # print(f"[INFO] Total generated actions: {len(actions)}")
     # print(f"[INFO] first 5 actions:{actions[:5]}")
     return actions
+
 
 # ==========================================================
 # 導航與影片錄製
@@ -787,17 +801,16 @@ if __name__ == "__main__":
     color_map = load_semantic_table(EXCEL_PATH)
     id_map = load_semantic_ID_table(EXCEL_PATH)
     
-    TARGET_CLASS = "sofa"
+    TARGET_CLASS = "window"
     goal, mask = find_object_region(MAP_PATH, color_map, TARGET_CLASS)
     start = (335, 240) # window test final: 要繞過椅子等 還要左右轉彎
     start = (236, 457) # window test1: 直線行走左右有障礙 可能卡牆 pass
-    
-    start = (382, 256) # sofa test1: 直線走 pass
-    # start = (212, 428) # base-cabinet test1: 直線走
+    # start = (382, 256) # sofa test1: 直線走 pass
+    start = (212, 428) # base-cabinet test1: 直線走
 
     map_gray = cv2.imread(MAP_PATH, cv2.IMREAD_GRAYSCALE)
     _, binary = cv2.threshold(map_gray, 240, 255, cv2.THRESH_BINARY)
-# === 解決方案：侵蝕可行走區域 (建立安全緩衝區) ===
+    # === 解決方案：侵蝕可行走區域 (建立安全緩衝區) ===
     print("[INFO] 正在侵蝕可行走區域以建立安全緩衝區...")
     
     # 決定緩衝區的大小 (kernel 越大，緩衝區越寬，路徑越保守)
@@ -825,13 +838,6 @@ if __name__ == "__main__":
     # world_path = [(x * 40, z * 40) for (x, z) in world_path]  # 保留縮放
     world_path = simplify_path(world_path, min_step=0.25)
     print(f"[INFO] Simplified path from {len(path)} → {len(world_path)} points")
-    # for i in range(5):
-    #     (x1, z1), (x2, z2) = world_path[i], world_path[i+1]
-    #     print(f"Segment {i}: dist={math.hypot(x2 - x1, z2 - z1):.3f}")
-
-    # print("[DEBUG] First few world_path coords:")
-    # for i, p in enumerate(world_path[:5]):
-    #     print(f"  {i}: {p}")
     # Habitat 環境
     sim_settings = {
         "scene": "/home/clu98753cs13/Desktop/course/phyai/physical-ai25/hw0/replica_v1/apartment_0/habitat/mesh_semantic.ply",

@@ -809,9 +809,9 @@ def run_navigation_replan(env, binary_map, safe_binary_map, color_map, bounds, s
 
                     # 保留 Debug 輸出
                     print(f"[DEBUG] pos=({pos[0]:.2f},{pos[2]:.2f}), "
-                          f"subgoal=({current_target_subgoal_world[0]:.2f},{current_target_subgoal_world[1]:.2f}), "
-                          f"final_goal=({subgoals[-1][0]:.2f},{subgoals[-1][1]:.2f}), "
-                          f"dist_to_subgoal={dist_to_current_subgoal:.3f}, dist_to_final_goal={dist_to_final_goal:.3f}, dist_to_path={current_dist_to_path:.3f}") # 保留 Print
+                        f"subgoal=({current_target_subgoal_world[0]:.2f},{current_target_subgoal_world[1]:.2f}), "
+                        f"final_goal=({subgoals[-1][0]:.2f},{subgoals[-1][1]:.2f}), "
+                        f"dist_to_subgoal={dist_to_current_subgoal:.3f}, dist_to_final_goal={dist_to_final_goal:.3f}, dist_to_path={current_dist_to_path:.3f}") # 保留 Print
 
                     # ======= 事件偵測 =======
                     # 1. 到達 *當前子目標*
