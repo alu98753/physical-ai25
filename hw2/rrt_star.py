@@ -221,13 +221,13 @@ def get_sector_distances(dist_map, center, heading_rad, fov_deg=60, radius=30):
     """
     取得 agent 前方扇形區域的距離牆分佈。
     參數：
-      dist_map : np.ndarray - cv2.distanceTransform 結果
-      center : (x, y)
-      heading_rad : float - 朝向 (弧度)
-      fov_deg : float - 視野角 (例如60度代表 ±30度)
-      radius : int - 搜索半徑像素
+        dist_map : np.ndarray - cv2.distanceTransform 結果
+        center : (x, y)
+        heading_rad : float - 朝向 (弧度)
+        fov_deg : float - 視野角 (例如60度代表 ±30度)
+        radius : int - 搜索半徑像素
     回傳：
-      np.ndarray - 扇形區域內所有距離值（用於 np.percentile）
+        np.ndarray - 扇形區域內所有距離值（用於 np.percentile）
     """
     H, W = dist_map.shape
     cx, cy = center
@@ -301,18 +301,209 @@ def get_safety_penalty(point, goal_point, dist_map, SAFE_WEIGHT, GOAL_SAFETY_EXE
             safety_penalty = SAFE_WEIGHT / ((d_safe + 1e-3) ** 2)
 
     return safety_penalty
-  
+
+# ==========================================================
+# 🔍 工具函式：找最近可行走點 (保持不變)
+# ==========================================================
+def is_safe_point(map_img, x, y, r=5):
+    """
+    該點 (x,y) 及其以 r 為半徑的方形鄰域是否全為 free(>=128)。
+    """
+    H, W = map_img.shape[:2]
+    x, y = int(round(x)), int(round(y))
+    for dy in range(-r, r + 1):
+        ny = y + dy
+        if ny < 0 or ny >= H:
+            return False
+        for dx in range(-r, r + 1):
+            nx = x + dx
+            if nx < 0 or nx >= W:
+                return False
+            if map_img[ny, nx] < 128:
+                return False
+    return True
+
+
+def find_nearest_safe_point_radial(map_img, p, max_radius=30, safe_radius=5, neighbor_check=4):
+    # ... (保持不變)
+    H, W = map_img.shape[:2]
+    gx, gy = int(p[0]), int(p[1])
+
+    for r in range(0, max_radius + 1):
+        candidates = []
+        candidates += [(gx, gy - r), (gx, gy + r), (gx - r, gy), (gx + r, gy)]
+        for dy in range(-r, r + 1):
+            candidates.append((gx - r, gy + dy))
+            candidates.append((gx + r, gy + dy))
+        for dx in range(-r + 1, r):
+            candidates.append((gx + dx, gy - r))
+            candidates.append((gx + dx, gy + r))
+
+        seen = set()
+        uniq = []
+        for (x, y) in candidates:
+            if (x, y) not in seen:
+                seen.add((x, y))
+                uniq.append((x, y))
+
+        for (x, y) in uniq:
+            if 0 <= x < W and 0 <= y < H and map_img[y, x] >= 128:
+                if is_safe_point(map_img, x, y, r=safe_radius):
+                    return (x, y)
+
+    print("⚠️ [警告] 找不到附近安全點，回傳原點。")
+    return (gx, gy)
+
+
+def find_safe_goal_along_line(map_img, start, goal, step=1, safe_radius=5):
+    # ... (保持不變)
+    gx, gy = goal
+    sx, sy = start
+    H, W = map_img.shape[:2]
+
+    dx, dy = sx - gx, sy - gy
+    dist = math.hypot(dx, dy)
+    if dist == 0:
+        return goal
+    dx, dy = dx / dist, dy / dist
+
+    for t in np.arange(0, dist, step):
+        x = gx + dx * t
+        y = gy + dy * t
+        if 0 <= int(x) < W and 0 <= int(y) < H and map_img[int(y), int(x)] >= 128:
+            if is_safe_point(map_img, x, y, r=safe_radius):
+                return (int(x), int(y))
+
+    print("⚠️ [警告] 找不到沿線安全 goal，回傳原始 goal。")
+    return goal
+
+# ==========================================================
+# ======= 語意表/互動/視覺化函式 (保持不變) =======
+# ==========================================================
+
+
+def load_semantic_table(excel_path):
+    # ... (保持不變)
+    df = pd.read_excel(excel_path)
+    color_col = None
+    name_col = None
+    for c in df.columns:
+        if "Color_Code" in c and "(R" in c:
+            color_col = c
+        elif c.strip().lower() in ["name", "class", "object", "color", "color name"]:
+            name_col = c
+    if color_col is None or name_col is None:
+        raise ValueError(f"❌ 無法在 Excel 中找到顏色或名稱欄位，檢查欄名：{list(df.columns)}")
+    color_map = {}
+    for _, row in df.iterrows():
+        id = row[0]
+        name = str(row[name_col]).strip().lower()
+        color_str = str(row[color_col]).strip()
+        nums = [int(v) for v in color_str.replace(
+            "(", "").replace(")", "").split(",") if v.strip().isdigit()]
+        if len(nums) == 3:
+            color_map[name] = tuple(nums)
+    print(f"[INFO] 成功載入 {len(color_map)} 個語意分類。")
+    return color_map
+
+
+def load_semantic_ID_table(excel_path):
+    # ... (保持不變)
+    df = pd.read_excel(excel_path)
+
+    id_col = df.columns[0]
+    name_col = None
+
+    for c in df.columns:
+        if c.strip().lower() in ["name", "class", "object", "color", "color name"]:
+            name_col = c
+
+    if name_col is None:
+        raise ValueError(f"❌ 無法在 Excel 中找到名稱欄位，檢查欄名：{list(df.columns)}")
+
+    id_map = {}
+    for _, row in df.iterrows():
+        obj_id = int(row[id_col]) if not pd.isna(row[id_col]) else None
+        name = str(row[name_col]).strip().lower()
+        if obj_id is not None and name:
+            id_map[name] = obj_id
+
+    print(f"[INFO] 成功載入 {len(id_map)} 個語意分類。")
+    return id_map
+
+
+def find_object_region(map_path, color_map, target_class):
+    # ... (保持不變)
+    img = cv2.imread(map_path)
+    if img is None:
+        raise FileNotFoundError(f"❌ 找不到地圖: {map_path}")
+    target_class = target_class.lower()
+    if target_class not in color_map:
+        raise ValueError(f"⚠️ 類別 '{target_class}' 不在語意表中。")
+    bgr_color = tuple(reversed(color_map[target_class]))
+    mask = cv2.inRange(img, bgr_color, bgr_color)
+    coords = cv2.findNonZero(mask)
+    if coords is None:
+        raise ValueError(f"⚠️ 找不到目標類別 '{target_class}' 的區域。")
+    mean = np.mean(coords, axis=0)[0]
+    goal = (int(mean[0]), int(mean[1]))
+    print(f"[INFO] {target_class} 目標中心座標: {goal}")
+    return goal, mask
+
+
+def select_start(map_path, goal):
+    # ... (保持不變)
+    img = cv2.imread(map_path)
+    img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+    plt.imshow(img_rgb)
+    plt.scatter(goal[0], goal[1], c='red', s=80, label='Goal')
+    plt.title("點選起點 (Start)")
+    plt.legend()
+    pts = plt.ginput(1, timeout=0)
+    plt.close()
+    start = tuple(map(int, pts[0]))
+    return start
+
+
+def visualize_rrt(map_img, nodes, start, goal, path):
+    # ... (保持不變)
+    plt.figure(figsize=(8, 8))
+    plt.imshow(map_img, cmap='gray')
+    plt.plot(start[0], start[1], "go", markersize=8, label="Start")
+    plt.plot(goal[0], goal[1], "ro", markersize=8, label="Goal")
+    for node in nodes:
+        if node.parent is not None:
+            plt.plot([node.x, node.parent.x], [
+                    node.y, node.parent.y], "b-", linewidth=0.4)
+    if path:
+        px, py = zip(*path)
+        plt.plot(px, py, "r-", linewidth=2.0, label="Path (RRT* + smooth)")
+    plt.legend()
+    plt.axis("equal")
+    plt.show()
+
 
 # ==========================================================
 # RRT* 主算法
 # ==========================================================
-def rrt_star_planning(map_img, start, goal, dist_map=None, SAFE_WEIGHT=10000.0, D_SAFE_MAX_FOR_SAMPLING=1.0):
+def rrt_star_planning(map_img, start, goal, SAFE_WEIGHT=10000.0):
     """
     改良版 RRT*：使用統一的倒數平方懲罰推離牆面。
     ✅ 使用 R-Tree 取代 KD-Tree 以實現 $O(\log N)$ 增量更新
     """
     H, W = map_img.shape[:2]
+    # 加一道「安全膨脹」：侵蝕可行區（用來避免鑽窄縫和牆體瑕疵）
+    kernel = np.ones((15, 15), np.uint8)
+    map_img = cv2.morphologyEx(map_img, cv2.MORPH_OPEN, kernel)
+    map_img = cv2.erode(map_img, kernel, iterations=1)
 
+    # 計算距離地圖 (Distance Transform)
+    dist_map = cv2.distanceTransform(map_img, cv2.DIST_L2, 5)
+    d_safe_max = np.percentile(dist_map, 60)
+
+    if d_safe_max < 1e-6:
+        d_safe_max = 1.0
+    D_SAFE_MAX_FOR_SAMPLING = d_safe_max
     # === (起點/目標點檢查 ... 保持不變) ===
     # ... (此處代碼不變)
     if not (0 <= start[0] < W and 0 <= start[1] < H) or map_img[int(start[1]), int(start[0])] < 128 \
@@ -325,10 +516,10 @@ def rrt_star_planning(map_img, start, goal, dist_map=None, SAFE_WEIGHT=10000.0, 
 
     if not (0 <= goal[0] < W and 0 <= goal[1] < H) or map_img[int(goal[1]), int(goal[0])] < 128 \
             or not is_safe_point(map_img, goal[0], goal[1], r=5):
-        print("⚠️ [提醒] 目標在障礙/不安全，沿連線尋找安全替代點 ...")
+        print("⚠️ [提醒] 目標在障礙/不安全，以目標為中心徑向尋找安全替代點 ...")
         goal_old = goal
-        goal = find_safe_goal_along_line(
-            map_img, start, goal, step=1, safe_radius=5)
+        goal = find_nearest_safe_point_radial(
+            map_img, goal, max_radius=30, safe_radius=5) 
         print(f"✅ [修正] Goal: {goal_old} → {goal}")
     # =====================================
     print("[INFO] 正在計算可行走區域的連通元件...")
@@ -550,190 +741,9 @@ def rrt_star_planning(map_img, start, goal, dist_map=None, SAFE_WEIGHT=10000.0, 
 
     raw_path = extract_path(best_goal_node)
     # 啟用平滑化
-    raw_path = smooth_path(map_img, raw_path, iterations=SMOOTH_ITER)
+    # raw_path = smooth_path(map_img, raw_path, iterations=SMOOTH_ITER)
 
     return raw_path, nodes
-
-# ==========================================================
-# 🔍 工具函式：找最近可行走點 (保持不變)
-# ==========================================================
-def is_safe_point(map_img, x, y, r=5):
-    """
-    該點 (x,y) 及其以 r 為半徑的方形鄰域是否全為 free(>=128)。
-    """
-    H, W = map_img.shape[:2]
-    x, y = int(round(x)), int(round(y))
-    for dy in range(-r, r + 1):
-        ny = y + dy
-        if ny < 0 or ny >= H:
-            return False
-        for dx in range(-r, r + 1):
-            nx = x + dx
-            if nx < 0 or nx >= W:
-                return False
-            if map_img[ny, nx] < 128:
-                return False
-    return True
-
-
-def find_nearest_safe_point_radial(map_img, p, max_radius=30, safe_radius=5, neighbor_check=4):
-    # ... (保持不變)
-    H, W = map_img.shape[:2]
-    gx, gy = int(p[0]), int(p[1])
-
-    for r in range(0, max_radius + 1):
-        candidates = []
-        candidates += [(gx, gy - r), (gx, gy + r), (gx - r, gy), (gx + r, gy)]
-        for dy in range(-r, r + 1):
-            candidates.append((gx - r, gy + dy))
-            candidates.append((gx + r, gy + dy))
-        for dx in range(-r + 1, r):
-            candidates.append((gx + dx, gy - r))
-            candidates.append((gx + dx, gy + r))
-
-        seen = set()
-        uniq = []
-        for (x, y) in candidates:
-            if (x, y) not in seen:
-                seen.add((x, y))
-                uniq.append((x, y))
-
-        for (x, y) in uniq:
-            if 0 <= x < W and 0 <= y < H and map_img[y, x] >= 128:
-                if is_safe_point(map_img, x, y, r=safe_radius):
-                    return (x, y)
-
-    print("⚠️ [警告] 找不到附近安全點，回傳原點。")
-    return (gx, gy)
-
-
-def find_safe_goal_along_line(map_img, start, goal, step=1, safe_radius=5):
-    # ... (保持不變)
-    gx, gy = goal
-    sx, sy = start
-    H, W = map_img.shape[:2]
-
-    dx, dy = sx - gx, sy - gy
-    dist = math.hypot(dx, dy)
-    if dist == 0:
-        return goal
-    dx, dy = dx / dist, dy / dist
-
-    for t in np.arange(0, dist, step):
-        x = gx + dx * t
-        y = gy + dy * t
-        if 0 <= int(x) < W and 0 <= int(y) < H and map_img[int(y), int(x)] >= 128:
-            if is_safe_point(map_img, x, y, r=safe_radius):
-                return (int(x), int(y))
-
-    print("⚠️ [警告] 找不到沿線安全 goal，回傳原始 goal。")
-    return goal
-
-# ==========================================================
-# ======= 語意表/互動/視覺化函式 (保持不變) =======
-# ==========================================================
-
-
-def load_semantic_table(excel_path):
-    # ... (保持不變)
-    df = pd.read_excel(excel_path)
-    color_col = None
-    name_col = None
-    for c in df.columns:
-        if "Color_Code" in c and "(R" in c:
-            color_col = c
-        elif c.strip().lower() in ["name", "class", "object", "color", "color name"]:
-            name_col = c
-    if color_col is None or name_col is None:
-        raise ValueError(f"❌ 無法在 Excel 中找到顏色或名稱欄位，檢查欄名：{list(df.columns)}")
-    color_map = {}
-    for _, row in df.iterrows():
-        id = row[0]
-        name = str(row[name_col]).strip().lower()
-        color_str = str(row[color_col]).strip()
-        nums = [int(v) for v in color_str.replace(
-            "(", "").replace(")", "").split(",") if v.strip().isdigit()]
-        if len(nums) == 3:
-            color_map[name] = tuple(nums)
-    print(f"[INFO] 成功載入 {len(color_map)} 個語意分類。")
-    return color_map
-
-
-def load_semantic_ID_table(excel_path):
-    # ... (保持不變)
-    df = pd.read_excel(excel_path)
-
-    id_col = df.columns[0]
-    name_col = None
-
-    for c in df.columns:
-        if c.strip().lower() in ["name", "class", "object", "color", "color name"]:
-            name_col = c
-
-    if name_col is None:
-        raise ValueError(f"❌ 無法在 Excel 中找到名稱欄位，檢查欄名：{list(df.columns)}")
-
-    id_map = {}
-    for _, row in df.iterrows():
-        obj_id = int(row[id_col]) if not pd.isna(row[id_col]) else None
-        name = str(row[name_col]).strip().lower()
-        if obj_id is not None and name:
-            id_map[name] = obj_id
-
-    print(f"[INFO] 成功載入 {len(id_map)} 個語意分類。")
-    return id_map
-
-
-def find_object_region(map_path, color_map, target_class):
-    # ... (保持不變)
-    img = cv2.imread(map_path)
-    if img is None:
-        raise FileNotFoundError(f"❌ 找不到地圖: {map_path}")
-    target_class = target_class.lower()
-    if target_class not in color_map:
-        raise ValueError(f"⚠️ 類別 '{target_class}' 不在語意表中。")
-    bgr_color = tuple(reversed(color_map[target_class]))
-    mask = cv2.inRange(img, bgr_color, bgr_color)
-    coords = cv2.findNonZero(mask)
-    if coords is None:
-        raise ValueError(f"⚠️ 找不到目標類別 '{target_class}' 的區域。")
-    mean = np.mean(coords, axis=0)[0]
-    goal = (int(mean[0]), int(mean[1]))
-    print(f"[INFO] {target_class} 目標中心座標: {goal}")
-    return goal, mask
-
-
-def select_start(map_path, goal):
-    # ... (保持不變)
-    img = cv2.imread(map_path)
-    img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-    plt.imshow(img_rgb)
-    plt.scatter(goal[0], goal[1], c='red', s=80, label='Goal')
-    plt.title("點選起點 (Start)")
-    plt.legend()
-    pts = plt.ginput(1, timeout=0)
-    plt.close()
-    start = tuple(map(int, pts[0]))
-    return start
-
-
-def visualize_rrt(map_img, nodes, start, goal, path):
-    # ... (保持不變)
-    plt.figure(figsize=(8, 8))
-    plt.imshow(map_img, cmap='gray')
-    plt.plot(start[0], start[1], "go", markersize=8, label="Start")
-    plt.plot(goal[0], goal[1], "ro", markersize=8, label="Goal")
-    for node in nodes:
-        if node.parent is not None:
-            plt.plot([node.x, node.parent.x], [
-                     node.y, node.parent.y], "b-", linewidth=0.4)
-    if path:
-        px, py = zip(*path)
-        plt.plot(px, py, "r-", linewidth=2.0, label="Path (RRT* + smooth)")
-    plt.legend()
-    plt.axis("equal")
-    plt.show()
-
 
 # ==========================================================
 # 主流程
@@ -746,18 +756,6 @@ if __name__ == "__main__":
     if map_img_gray is None:
         raise FileNotFoundError(MAP_PATH)
     _, binary_map = cv2.threshold(map_img_gray, 240, 255, cv2.THRESH_BINARY)
-
-    # 加一道「安全膨脹」：侵蝕可行區（用來避免鑽窄縫和牆體瑕疵）
-    kernel = np.ones((15, 15), np.uint8)
-    binary_map = cv2.morphologyEx(binary_map, cv2.MORPH_OPEN, kernel)
-    binary_map = cv2.erode(binary_map, kernel, iterations=1)
-
-    # 計算距離地圖 (Distance Transform)
-    dist_map = cv2.distanceTransform(binary_map, cv2.DIST_L2, 5)
-    d_safe_max = np.percentile(dist_map, 60)
-
-    if d_safe_max < 1e-6:
-        d_safe_max = 1.0
 
     # Step 1. 載入語意表與地圖 (略)
     color_map = load_semantic_table(EXCEL_PATH)
@@ -785,11 +783,9 @@ if __name__ == "__main__":
     goal, mask = find_object_region(MAP_PATH, color_map, target_class)
     start = select_start(MAP_PATH, goal)
 
-    # 執行 RRT*
-    # ✅ 調整 SAFE_WEIGHT，採用一個巨大的懲罰係數來推離牆壁
-    path, nodes = rrt_star_planning(binary_map, start, goal, dist_map,
-                                    SAFE_WEIGHT=500000,
-                                    D_SAFE_MAX_FOR_SAMPLING=d_safe_max)
+    # 執行 RRT* : 調整 SAFE_WEIGHT，採用一個巨大的懲罰係數來推離牆壁
+    path, nodes = rrt_star_planning(binary_map, start, goal,
+                                    SAFE_WEIGHT=500000)
     # 顯示結果
     if path:
         visualize_rrt(binary_map, nodes, start, goal, path)
