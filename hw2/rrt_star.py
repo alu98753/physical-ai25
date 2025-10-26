@@ -784,8 +784,7 @@ if __name__ == "__main__":
     start = select_start(MAP_PATH, goal)
 
     # 執行 RRT* : 調整 SAFE_WEIGHT，採用一個巨大的懲罰係數來推離牆壁
-    path, nodes = rrt_star_planning(binary_map, start, goal,
-                                    SAFE_WEIGHT=500000)
+    path, nodes = rrt_star_planning(binary_map, start, goal, SAFE_WEIGHT=500000)
     # 顯示結果
     if path:
         visualize_rrt(binary_map, nodes, start, goal, path)

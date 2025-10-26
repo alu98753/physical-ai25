@@ -298,7 +298,7 @@ def end_anime(rgb):
     cv2.putText(vis, text, (text_x, text_y), font, font_scale, (0, 255, 0), thickness, cv2.LINE_AA)
     return vis
 
-def create_subgoals(world_path, segment_distance_m=2.0):
+def create_subgoals(world_path, segment_distance_m=1.0):
     """
     從完整的 world_path 中，每隔約 segment_distance_m 選取一個點作為子目標。
     """
@@ -486,8 +486,8 @@ def _execute_smart_escape(env, escape_turn_angle, escape_backward_dist, proactiv
     # --- 10. Return final state ---
     return obs, frame_count
 
-def run_navigation_replan(env, binary_map, safe_binary_map, color_map, bounds, start_pixel_orig, goal_pixel_orig, target_mask,
-                        output_video="result_replan.mp4", replan_thresh=0.3, segment_distance_m=2.0,
+def run_navigation_replan(env, binary_map, color_map, bounds, start_pixel_orig, goal_pixel_orig, target_mask,
+                        output_video="result_replan.mp4", replan_thresh=0.3, segment_distance_m=1.0,
                         # --- Avoidance Params ---
                         proactive_avoidance_threshold=5000,
                         escape_backward_dist=0.5,
@@ -510,7 +510,7 @@ def run_navigation_replan(env, binary_map, safe_binary_map, color_map, bounds, s
 
     # === 1. Initialization & Subgoal Generation (Unchanged) ===
     print("[INFO] Starting initial path planning (for subgoal generation)...")
-    initial_path_pixel, _ = rrt_star_planning(safe_binary_map, start_pixel_orig, goal_pixel_orig)
+    initial_path_pixel, _ = rrt_star_planning(binary_map, start_pixel_orig, goal_pixel_orig)
     if initial_path_pixel is None:
         print("[FAIL] Initial RRT* planning failed. Cannot start navigation.")
         vw.release()
@@ -551,20 +551,20 @@ def run_navigation_replan(env, binary_map, safe_binary_map, color_map, bounds, s
             current_pos = current_state.position.copy()
             current_pixel = world_to_pixel(current_pos[0], current_pos[2], w, h, bounds)
             
-            path_pixel_segment, _ = rrt_star_planning(safe_binary_map, current_pixel, current_target_subgoal_pixel)
+            path_pixel_segment, _ = rrt_star_planning(binary_map, current_pixel, current_target_subgoal_pixel)
             retry_segment = 0
             while path_pixel_segment is None and retry_segment < 3:
-                 print(f"[WARN] Cannot plan path to subgoal {current_subgoal_index}, retrying ({retry_segment+1}/3)...")
-                 path_pixel_segment, _ = rrt_star_planning(safe_binary_map, current_pixel, current_target_subgoal_pixel)
-                 retry_segment += 1
+                print(f"[WARN] Cannot plan path to subgoal {current_subgoal_index}, retrying ({retry_segment+1}/3)...")
+                path_pixel_segment, _ = rrt_star_planning(binary_map, current_pixel, current_target_subgoal_pixel)
+                retry_segment += 1
             if path_pixel_segment is None:
-                 print(f"[FAIL] Failed to plan path to subgoal {current_subgoal_index} after retries. Aborting.")
-                 return
+                print(f"[FAIL] Failed to plan path to subgoal {current_subgoal_index} after retries. Aborting.")
+                return
 
             current_segment_world_path = [pixel_to_world(u, v, w, h, bounds) for (u, v) in path_pixel_segment]
             if not current_segment_world_path:
-                 print(f"[FAIL] Path segment for subgoal {current_subgoal_index} is empty. Aborting.")
-                 return
+                print(f"[FAIL] Path segment for subgoal {current_subgoal_index} is empty. Aborting.")
+                return
             
             # --- 2c. Inner Loop: Reactive Navigation ---
             subgoal_reached = False
@@ -754,17 +754,11 @@ if __name__ == "__main__":
     # start = (212, 428) # 直線
 
     map_gray = cv2.imread(MAP_PATH, cv2.IMREAD_GRAYSCALE)
-    _, binary = cv2.threshold(map_gray, 240, 255, cv2.THRESH_BINARY)
+    _, binary_map = cv2.threshold(map_gray, 240, 255, cv2.THRESH_BINARY)
     
-    # --- 安全地圖 (用於 RRT* 規劃) ---
-    print("[INFO] 正在建立 RRT* 安全緩衝區...")
-    kernel_size = 15 # 保留 V1 的 15x15
-    kernel = np.ones((kernel_size, kernel_size), np.uint8)
-    safe_binary_map = cv2.erode(binary, kernel, iterations=1)
-    print("[INFO] 安全緩衝區建立完畢。")
     
     # --- ✅ 步驟 1: 全域路徑規劃 (只執行一次) ---
-    path, _ = rrt_star_planning(safe_binary_map, start, goal)
+    path, _ = rrt_star_planning(binary_map, start, goal,SAFE_WEIGHT=500000)
     if path is None:
         print("❌ 無法找到初始可行路徑。")
         exit()
@@ -819,8 +813,8 @@ if __name__ == "__main__":
 
     # === ✅ 步驟 3: 執行 V3 統一控制器 ===
     video_path = f"{OUTPUT_PATH}/{TARGET_CLASS}_V3_controller.mp4"
-    run_navigation_replan(env, binary, safe_binary_map, color_map, bounds, start, goal, target_mask,
-                output_video="result_replan.mp4", replan_thresh=0.3, segment_distance_m=2.0,
+    run_navigation_replan(env, binary_map, color_map, bounds, start, goal, target_mask,
+                output_video="result_replan.mp4", replan_thresh=0.3, segment_distance_m=1.0,
                 # --- 避障參數 ---
                 proactive_avoidance_threshold=5000,
                 escape_backward_dist=0.5,
