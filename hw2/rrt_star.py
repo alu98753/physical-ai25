@@ -881,53 +881,53 @@ def rrt_star_planning(map_img, start, goal, SAFE_WEIGHT=10000.0):
             start_dist_map, 
             start,          # 傳入修正後的 start 點
             goal_old, 
-            max_radius=150, # 增加搜索半徑
+            max_radius=180, # 增加搜索半徑
             safe_radius=5,
             path_ratio_threshold=2.0 # 可調整此比率
         )
         
         if goal is None:
-            # 如果新函數返回 None，代表在 150px 內找不到替代點
-            print(f"❌ 錯誤：在原始目標 {goal_old} 附近 150px 內，找不到「內部」安全替代點。")
+            # 如果新函數返回 None，代表在 180px 內找不到替代點
+            print(f"❌ 錯誤：在原始目標 {goal_old} 附近 180px 內，找不到「內部」安全替代點。")
             return None, []
             
         print(f"Goal: {goal_old} → {goal}")
         is_goal_modified = (goal_old != goal)
     
-    # === (起點/目標點檢查 結束) ===
-    # ==========================================================
-    if is_start_modified or is_goal_modified:
-        plt.figure(figsize=(8, 8))
-        # 顯示處理過的安全地圖 (morphologyEx/erode後的版本)
-        plt.imshow(map_img, cmap='gray') 
-        plt.title("Start/Goal 修正結果 (綠色→原始點, 紅色→修正後的安全點)")
+    # # === (起點/目標點檢查 結束) ===
+    # # ==========================================================
+    # if is_start_modified or is_goal_modified:
+    #     plt.figure(figsize=(8, 8))
+    #     # 顯示處理過的安全地圖 (morphologyEx/erode後的版本)
+    #     plt.imshow(map_img, cmap='gray') 
+    #     plt.title("Start/Goal 修正結果 (綠色→原始點, 紅色→修正後的安全點)")
         
-        # 繪製 Start 點
-        if is_start_modified:
-            # 原始點 (標記為綠色圓圈)
-            plt.plot(start_old[0], start_old[1], "go", markersize=10, 
-                     markerfacecolor='none', markeredgecolor='green', label="Original Start")
-            # 修正後的點 (標記為綠色X)
-            plt.plot(start[0], start[1], "gx", markersize=10, label="Safe Start")
-            # 畫一條線連接
-            plt.plot([start_old[0], start[0]], [start_old[1], start[1]], "g--", linewidth=1.0)
-        else:
-             plt.plot(start[0], start[1], "gx", markersize=10, label="Start (No change)")
+    #     # 繪製 Start 點
+    #     if is_start_modified:
+    #         # 原始點 (標記為綠色圓圈)
+    #         plt.plot(start_old[0], start_old[1], "go", markersize=10, 
+    #                  markerfacecolor='none', markeredgecolor='green', label="Original Start")
+    #         # 修正後的點 (標記為綠色X)
+    #         plt.plot(start[0], start[1], "gx", markersize=10, label="Safe Start")
+    #         # 畫一條線連接
+    #         plt.plot([start_old[0], start[0]], [start_old[1], start[1]], "g--", linewidth=1.0)
+    #     else:
+    #          plt.plot(start[0], start[1], "gx", markersize=10, label="Start (No change)")
         
-        # 繪製 Goal 點
-        if is_goal_modified:
-            # 原始點 (標記為紅色圓圈)
-            plt.plot(goal_old[0], goal_old[1], "ro", markersize=10, 
-                     markerfacecolor='none', markeredgecolor='red', label="Original Goal")
-            plt.plot(goal[0], goal[1], "rx", markersize=10, label="Safe Goal")
-            plt.plot([goal_old[0], goal[0]], [goal_old[1], goal[1]], "r--", linewidth=1.0)
-        else:
-             plt.plot(goal[0], goal[1], "rx", markersize=10, label="Goal (No change)")
+    #     # 繪製 Goal 點
+    #     if is_goal_modified:
+    #         # 原始點 (標記為紅色圓圈)
+    #         plt.plot(goal_old[0], goal_old[1], "ro", markersize=10, 
+    #                  markerfacecolor='none', markeredgecolor='red', label="Original Goal")
+    #         plt.plot(goal[0], goal[1], "rx", markersize=10, label="Safe Goal")
+    #         plt.plot([goal_old[0], goal[0]], [goal_old[1], goal[1]], "r--", linewidth=1.0)
+    #     else:
+    #          plt.plot(goal[0], goal[1], "rx", markersize=10, label="Goal (No change)")
 
-        plt.legend()
-        plt.axis("equal")
-        plt.show() # 暫停執行，等待使用者關閉視窗
-        plt.close()        
+    #     plt.legend()
+    #     plt.axis("equal")
+    #     plt.show() # 暫停執行，等待使用者關閉視窗
+    #     plt.close()        
 
     # =====================================
     # print("[INFO] 正在計算可行走區域的連通元件...")
@@ -936,56 +936,56 @@ def rrt_star_planning(map_img, start, goal, SAFE_WEIGHT=10000.0):
     # print(f"共有:{num_labels}個標籤")
     
     
-    # ‼️ 【【【新增的除錯視覺化程式碼】】】
-    print("[INFO] 正在產生標籤視覺化地圖 (Label Map)...")
+    # # ‼️ 【【【新增的除錯視覺化程式碼】】】
+    # print("[INFO] 正在產生標籤視覺化地圖 (Label Map)...")
     
-    # 1. 建立一個只顯示「障礙物 (label=0)」的遮罩
-    #    (label == 0) 會產生一個布林陣列，True 的地方就是 label 0
-    #    np.uint8(...) * 255 將 True 轉為 255 (白色)，False 轉為 0 (黑色)
-    obstacle_mask_vis = np.uint8(labels == 0) * 255
+    # # 1. 建立一個只顯示「障礙物 (label=0)」的遮罩
+    # #    (label == 0) 會產生一個布林陣列，True 的地方就是 label 0
+    # #    np.uint8(...) * 255 將 True 轉為 255 (白色)，False 轉為 0 (黑色)
+    # obstacle_mask_vis = np.uint8(labels == 0) * 255
     
-    # 2. 建立一個顯示「所有」連通區域的彩色地圖
-    #    標準化 labels 陣列 (從 0~num_labels 映射到 0~255)
-    labels_vis = cv2.normalize(labels, None, 0, 255, cv2.NORM_MINMAX, dtype=cv2.CV_8U)
-    #    套用色彩映射 (JET  colormap)
-    labels_color_vis = cv2.applyColorMap(labels_vis, cv2.COLORMAP_JET)
-    #    (重要) 把 label 0 (障礙物) 的地方強制塗成黑色，這樣比較容易看
-    labels_color_vis[labels == 0] = [0, 0, 0]
+    # # 2. 建立一個顯示「所有」連通區域的彩色地圖
+    # #    標準化 labels 陣列 (從 0~num_labels 映射到 0~255)
+    # labels_vis = cv2.normalize(labels, None, 0, 255, cv2.NORM_MINMAX, dtype=cv2.CV_8U)
+    # #    套用色彩映射 (JET  colormap)
+    # labels_color_vis = cv2.applyColorMap(labels_vis, cv2.COLORMAP_JET)
+    # #    (重要) 把 label 0 (障礙物) 的地方強制塗成黑色，這樣比較容易看
+    # labels_color_vis[labels == 0] = [0, 0, 0]
 
-    # 3. 使用 Matplotlib 顯示
-    plt.figure(figsize=(12, 6))
+    # # 3. 使用 Matplotlib 顯示
+    # plt.figure(figsize=(12, 6))
     
-    # 圖一：只顯示障礙物 (Label 0)
-    plt.subplot(1, 2, 1)
-    plt.imshow(obstacle_mask_vis, cmap='gray')
-    plt.title(f"Obstacles (Label=0) ONLY\n(侵蝕後的 {kernel_size}x{kernel_size} kernel)")
-    plt.scatter(start[0], start[1], c='lime', marker='x', s=100, label="Start")
-    plt.scatter(goal[0], goal[1], c='red', marker='x', s=100, label="Goal")
-    plt.legend()
+    # # 圖一：只顯示障礙物 (Label 0)
+    # plt.subplot(1, 2, 1)
+    # plt.imshow(obstacle_mask_vis, cmap='gray')
+    # plt.title(f"Obstacles (Label=0) ONLY\n(侵蝕後的 {kernel_size}x{kernel_size} kernel)")
+    # plt.scatter(start[0], start[1], c='lime', marker='x', s=100, label="Start")
+    # plt.scatter(goal[0], goal[1], c='red', marker='x', s=100, label="Goal")
+    # plt.legend()
 
-    # 圖二：顯示所有連通元件
-    plt.subplot(1, 2, 2)
-    plt.imshow(cv2.cvtColor(labels_color_vis, cv2.COLOR_BGR2RGB))
-    plt.title(f"All Connected Components\n(Total: {num_labels} labels)")
+    # # 圖二：顯示所有連通元件
+    # plt.subplot(1, 2, 2)
+    # plt.imshow(cv2.cvtColor(labels_color_vis, cv2.COLOR_BGR2RGB))
+    # plt.title(f"All Connected Components\n(Total: {num_labels} labels)")
     
-    # 標出 Start 和 Goal 實際落在哪個標籤上
-    try:
-        start_label_vis = labels[int(start[1]), int(start[0])]
-        goal_label_vis = labels[int(goal[1]), int(goal[0])]
-        plt.scatter(start[0], start[1], c='lime', marker='x', s=100, 
-                    label=f"Start (落在 Label {start_label_vis})")
-        plt.scatter(goal[0], goal[1], c='red', marker='x', s=100, 
-                    label=f"Goal (落在 Label {goal_label_vis})")
-    except IndexError:
-        print("警告：Start/Goal 座標可能在標籤圖之外。")
+    # # 標出 Start 和 Goal 實際落在哪個標籤上
+    # try:
+    #     start_label_vis = labels[int(start[1]), int(start[0])]
+    #     goal_label_vis = labels[int(goal[1]), int(goal[0])]
+    #     plt.scatter(start[0], start[1], c='lime', marker='x', s=100, 
+    #                 label=f"Start (落在 Label {start_label_vis})")
+    #     plt.scatter(goal[0], goal[1], c='red', marker='x', s=100, 
+    #                 label=f"Goal (落在 Label {goal_label_vis})")
+    # except IndexError:
+    #     print("警告：Start/Goal 座標可能在標籤圖之外。")
         
-    plt.legend()
+    # plt.legend()
     
-    print("[INFO] 顯示標籤地圖。請檢查 Start/Goal 是否落在同一個非 0 標籤上。")
-    print("       (關閉彈出視窗後，程式將繼續執行...)")
-    plt.show() # <--- 程式會暫停在這裡，直到你關閉視窗
-    plt.close()
-    # ‼️ 【【【除錯程式碼結束】】】
+    # print("[INFO] 顯示標籤地圖。請檢查 Start/Goal 是否落在同一個非 0 標籤上。")
+    # print("       (關閉彈出視窗後，程式將繼續執行...)")
+    # plt.show() # <--- 程式會暫停在這裡，直到你關閉視窗
+    # plt.close()
+    # # ‼️ 【【【除錯程式碼結束】】】
     
     # 獲取修正後的 start/goal 所在的區域標籤
     # 注意：labels 的索引是 (y, x)

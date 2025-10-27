@@ -8,10 +8,9 @@ from habitat_sim.utils.common import d3_40_colors_rgb, d3_40_colors_hex
 from PIL import Image
 import matplotlib.pyplot as plt
 # 確保 rrt_star.py 就在旁邊
-from rrt_star import rrt_star_planning
+from rrt_star import *
 # 確保 part2.py 就在旁邊 (或您已將 rrt_star.py 獨立出來)
-from part2 import load_semantic_ID_table, load_semantic_table, find_object_region
-
+# from part2 import *
 # ==========================================================
 # Habitat 環境封裝
 # ==========================================================
@@ -23,10 +22,10 @@ FPS = 120
 ARRIVAL_THRESH = 0.15 # 抵達目標的距離閾值 (米)
 
 # === V3 控制器參數 ===
-LOOKAHEAD_DISTANCE = 0.5        # (米) Pure Pursuit "胡蘿蔔" 的前瞻距離
+LOOKAHEAD_DISTANCE = 0.2        # (米) Pure Pursuit "胡蘿蔔" 的前瞻距離
 OBSTACLE_CLEARANCE_DIST = 0.2  # (米) 認定為障礙物的深度閾值
 PROACTIVE_THRESH_PIXELS = 3000  # (像素) 觸發主動避障的像素數量閾值
-CORRECTION_ANGLE_THRESH = 5.0   # (度) 循跡時的角度容忍範圍
+CORRECTION_ANGLE_THRESH = 2.0   # (度) 循跡時的角度容忍範圍
 STUCK_LIMIT = 100               # (幀) 卡住/震盪多少幀後觸發「最後手段」
 ESCAPE_BACKWARD_DIST = 0.5      # (米) 最後手段：後退距離
 ESCAPE_TURN_ANGLE = 45          # (度) 最後手段：轉向角度
@@ -70,12 +69,22 @@ class HabitatEnvWrapper:
             spec.sensor_type = stype
             spec.resolution = [settings["height"], settings["width"]]
             spec.position = [0.0, settings["sensor_height"], 0.0]
-            return spec
 
+            return spec
+        def make_foot_sensor(uuid, stype):
+            spec = habitat_sim.CameraSensorSpec()
+            spec.uuid = uuid
+            spec.sensor_type = stype
+            spec.resolution = [settings["height"], settings["width"]]
+            spec.position = [0.0, settings["sensor_foot_height"], 0.0]
+            # spec.orientation = [-math.pi / 4, 0, 0]            
+
+            return spec
         agent_cfg.sensor_specifications = [
             make_sensor("color_sensor", habitat_sim.SensorType.COLOR),
-            make_sensor("depth_sensor", habitat_sim.SensorType.DEPTH),
-            make_sensor("semantic_sensor", habitat_sim.SensorType.SEMANTIC)
+            make_sensor("depth", habitat_sim.SensorType.DEPTH),
+            make_sensor("semantic_sensor", habitat_sim.SensorType.SEMANTIC),
+            make_foot_sensor("foot_depth", habitat_sim.SensorType.DEPTH)
         ]
         return habitat_sim.Configuration(sim_cfg, [agent_cfg])
 
@@ -89,7 +98,8 @@ class HabitatEnvWrapper:
 
         return {
             "rgb": rgb_img, # 現在確保是 (H, W, 3)
-            "depth": obs["depth_sensor"],
+            "depth": obs["depth"],
+            "foot_depth": obs["foot_depth"],
             "semantic": self._decode_semantic(obs["semantic_sensor"]),
         }
 
@@ -99,6 +109,71 @@ class HabitatEnvWrapper:
         img.putpalette(d3_40_colors_rgb.flatten())
         img.putdata((semantic_obs.flatten() % 40).astype(np.uint8))
         return np.asarray(img.convert("RGB"))
+
+
+def transform_rgb_bgr(image):
+    return image[:, :, [2, 1, 0]]
+
+def transform_depth(image):
+    depth_img = (image / 10 * 255).astype(np.uint8)
+    return depth_img
+
+def transform_semantic(semantic_obs):
+    semantic_img = Image.new("P", (semantic_obs.shape[1], semantic_obs.shape[0]))
+    semantic_img.putpalette(d3_40_colors_rgb.flatten())
+    semantic_img.putdata((semantic_obs.flatten() % 40).astype(np.uint8))
+    semantic_img = semantic_img.convert("RGB")
+    semantic_img = cv2.cvtColor(np.asarray(semantic_img), cv2.COLOR_RGB2BGR)
+    return semantic_img
+
+# --- Target Mask 函數 ---
+def hex_to_rgb(hex_color):
+    hex_color = hex_color.strip().lower().replace('0x', '').replace('#', '')
+    if len(hex_color) != 6: raise ValueError(f"❌ 無效的 hex 色碼: {hex_color}")
+    return tuple(int(hex_color[i:i+2], 16) for i in (0, 2, 4))
+
+def target_mask(obs):
+    semantic_img = obs["semantic"]
+    target_id = id_map[target_class.lower()] % 40
+    target_rgb = hex_to_rgb(d3_40_colors_hex[target_id])
+    mask = cv2.inRange(semantic_img, target_rgb, target_rgb)
+    return (mask > 0).astype(np.uint8)
+
+
+def navigateAndSee(env_instance, action, target_mask_func):
+    """
+    執行一步、即時顯示觀測，並返回觀測值。
+    """
+    # 1. 執行 Wrapper 的 step
+    # 這會返回處理過的 {"rgb":..., "depth":..., "semantic":...}
+    observations = env_instance.step(action)
+
+    # 2. 準備主顯示 (使用 V3 的 overlay_mask 函數)
+    rgb_img = observations["rgb"]
+    mask = target_mask_func(observations) # 呼叫 target_mask
+    vis_img = overlay_mask(rgb_img, mask) # 合成遮罩
+
+    # 3. 顯示所有觀測
+    cv2.imshow("Navigation (Overlay)", transform_rgb_bgr(vis_img))
+    # cv2.imshow("Depth (Debug)", transform_depth(observations["depth"]))
+    # cv2.imshow("Semantic (Debug)", transform_rgb_bgr(observations["semantic"]))
+
+    # 4. 顯示攝影機姿態 (來自您的程式碼)
+    agent_state = env_instance.agent.get_state()
+    sensor_state = agent_state.sensor_states['color_sensor']
+    # print("camera pose: x y z rw rx ry rz")
+    # print(sensor_state.position[0],...) # (建議註解掉, 否則 log 會爆炸)
+
+    # 5. 刷新視窗 (!!!! 關鍵中的關鍵 !!!!)
+    # 沒有這行, 圖片不會更新
+    key = cv2.waitKey(1) & 0xFF
+    if key == ord('q'): # 允許按 'q' 提早結束
+        raise KeyboardInterrupt("User pressed 'q' to quit.")
+
+    # 6. 返回觀測值 (!!!! 關鍵 !!!!)
+    # 主導航邏輯 (run_navigation_replan) 需要這個 obs 來檢查深度
+    return observations
+
 
 # ==========================================================
 # 座標轉換 (保持不變)
@@ -242,7 +317,7 @@ def overlay_mask(rgb, mask, color=(255, 0, 0), alpha=0.15):
     dst = cv2.addWeighted(color_mask, alpha, rgb, 1 - alpha, 0)
     return dst
 
-def face_goal(env, goal, bounds, w, h, vw, target_mask, FPS=120, TURN_ANGLE=1):
+def face_goal(env, goal, bounds, w, h, target_mask, FPS=120, TURN_ANGLE=1):
     """
     抵達目標後, 旋轉朝向目標並結束錄影。
     """
@@ -262,29 +337,19 @@ def face_goal(env, goal, bounds, w, h, vw, target_mask, FPS=120, TURN_ANGLE=1):
 
     if turn_steps > 0:
         for i in range(turn_steps):
-            obs = env.step(turn_action)
-            rgb = obs["rgb"]
-            mask = target_mask(obs)
-            vis = overlay_mask(rgb, mask)
-            for _ in range(FPS * 2 // max(turn_steps, 1)):
-                vw.write(cv2.cvtColor(vis, cv2.COLOR_RGB2BGR))
+            obs = navigateAndSee(env, turn_action, target_mask)
     else:
-        obs = env.step("turn_left")
-        rgb = obs["rgb"]
-        mask = target_mask(obs)
-        vis = overlay_mask(rgb, mask)
-        for _ in range(FPS // 10):
-            vw.write(cv2.cvtColor(vis, cv2.COLOR_RGB2BGR))
+        obs = navigateAndSee(env, "turn_left", target_mask)
 
     # ( ... 結尾動畫 ... )
     rgb = obs["rgb"].copy()
     mask = target_mask(obs)
     vis = overlay_mask(rgb, mask)
     vis = end_anime(vis)
-    for _ in range(FPS * 3):
-        vw.write(cv2.cvtColor(vis, cv2.COLOR_RGB2BGR))
-    vw.release()
-    print(f"[END] Navigation finished with facing target.")
+    vis_bgr = transform_rgb_bgr(vis)
+    cv2.imshow("Navigation (Overlay)", vis_bgr)
+    print(f"[END] Navigation finished with facing target. Displaying final frame...")
+    cv2.waitKey(3000)
 
 def end_anime(rgb):
     text = "Reached Goal"
@@ -356,143 +421,247 @@ def visualize_path_on_map(map_path, path, goal, start, target_class, output_dir,
 
 # #########################################
 def _execute_smart_escape(env, escape_turn_angle, escape_backward_dist, proactive_avoidance_threshold,
-                        vw, target_mask, frame_count, FPS, FORWARD_STEP, TURN_ANGLE,commit_distance_m=0.5):
+                        target_mask, frame_count, FPS, FORWARD_STEP, TURN_ANGLE, commit_distance_m=0.5):
     """
-    執行智能脫困程序 (V6 "Peek" 邏輯)。
-    - Peek 左/右 尋找最佳方向。
-    - 後退。
-    - 轉向最佳方向。
-    - 向前移動直到脫離障礙物。
-    - 返回: (final_obs, updated_frame_count)
+    執行智能脫困 FSM (V11)
+    FSM 順序:
+    1. Peek (Setup)
+    2. Backward (Setup)
+    3. [Loop] -> Scan_Turn -> Commit
     """
     
-    print(f"[ESCAPE] Smart escape maneuver triggered. Peeking for escape route...")
+    print(f"[FSM] Smart escape maneuver triggered. FSM: Peek -> Backward -> [Scan->Commit Loop]")
     
-    # --- 1. Get original state ---
+    # === Phase 1: Setup (執行一次) ===
+
+    # --- 1. Get original state & Peek ---
     original_state = env.agent.get_state()
     original_pos = original_state.position
     original_rot = original_state.rotation
     
-    # --- 2. Define turn quaternions (for peeking) ---
     turn_angle_rad = math.radians(escape_turn_angle)
     y_axis = np.array([0, 1, 0])
-    
-    q_left = habitat_sim.utils.common.quat_from_angle_axis(
-        turn_angle_rad, y_axis
-    )
-    q_right = habitat_sim.utils.common.quat_from_angle_axis(
-        -turn_angle_rad, y_axis
-    )
+    q_left = habitat_sim.utils.common.quat_from_angle_axis(turn_angle_rad, y_axis)
+    q_right = habitat_sim.utils.common.quat_from_angle_axis(-turn_angle_rad, y_axis)
 
-    # --- 3. Peek Left ---
+    # Peek Left
     left_rot = original_rot * q_left
-    left_state = habitat_sim.AgentState()
-    left_state.position = original_pos
-    left_state.rotation = left_rot
-    
+    left_state = habitat_sim.AgentState(original_pos, left_rot)
     env.agent.set_state(left_state)
     obs_left = env.sim.get_sensor_observations()
-    depth_left = obs_left["depth_sensor"]
-    near_pixels_left = np.sum(depth_left < 0.2)
-    print(f"[ESCAPE] Peek Left ({escape_turn_angle} deg): {near_pixels_left} near pixels.")
+    near_pixels_left = np.sum(obs_left["depth"] < 0.2)
+    print(f"[FSM-PEEK] Peek Left ({escape_turn_angle} deg): {near_pixels_left} near pixels.")
 
-    # --- 4. Peek Right ---
+    # Peek Right
     right_rot = original_rot * q_right
-    right_state = habitat_sim.AgentState()
-    right_state.position = original_pos
-    right_state.rotation = right_rot
-    
+    right_state = habitat_sim.AgentState(original_pos, right_rot)
     env.agent.set_state(right_state)
     obs_right = env.sim.get_sensor_observations()
-    depth_right = obs_right["depth_sensor"]
-    near_pixels_right = np.sum(depth_right < 0.2)
-    print(f"[ESCAPE] Peek Right (-{escape_turn_angle} deg): {near_pixels_right} near pixels.")
+    near_pixels_right = np.sum(obs_right["depth"] < 0.2)
+    print(f"[FSM-PEEK] Peek Right (-{escape_turn_angle} deg): {near_pixels_right} near pixels.")
 
-    # --- 5. Return to Original State (CRITICAL) ---
+    # Return to Original State
     env.agent.set_state(original_state)
-    print("[ESCAPE] Returned to original orientation for decision.")
+    print("[FSM-PEEK] Returned to original orientation for decision.")
 
-    # --- 6. Decide Best Escape Direction ---
     if near_pixels_left <= near_pixels_right:
         escape_action = "turn_left"
-        print(f"[ESCAPE] Decision: Left is clearer ({near_pixels_left} vs {near_pixels_right}). Escaping left.")
+        print(f"[FSM-PEEK] Decision: Scan Left first.")
     else:
         escape_action = "turn_right"
-        print(f"[ESCAPE] Decision: Right is clearer ({near_pixels_right} vs {near_pixels_left}). Escaping right.")
+        print(f"[FSM-PEEK] Decision: Scan Right first.")
 
-    # --- 7. Execute Escape: Backward ---
-    print(f"[ESCAPE] Executing: Backward {escape_backward_dist}m")
-    backward_steps = max(1, int(escape_backward_dist / FORWARD_STEP))
-    obs = None # 確保 obs 至少被定義
-    for _ in range(backward_steps):
-        obs = env.step("move_backward")
-        rgb = obs["rgb"]; mask = target_mask(obs); vis = overlay_mask(rgb, mask)
-        vw.write(cv2.cvtColor(vis, cv2.COLOR_RGB2BGR)); frame_count += 1
-    
-    # --- 8. Execute Escape: Initial Turn ---
-    print(f"[ESCAPE] Executing: Initial Turn {escape_action} {escape_turn_angle} deg")
-    turn_steps = int(escape_turn_angle // TURN_ANGLE)
-    for _ in range(turn_steps):
-        obs = env.step(escape_action)
-        rgb = obs["rgb"]; mask = target_mask(obs); vis = overlay_mask(rgb, mask)
-        vw.write(cv2.cvtColor(vis, cv2.COLOR_RGB2BGR)); frame_count += 1
-    
-# ========== [!!! V9 FIX !!!] ==========
-    # --- 9. V9 Logic: Escape "Commit" Sub-Loop ---
-    # 強制向前移動 commit_distance_m，以鞏固脫困方向
-    # 除非在此過程中又撞到 *新* 的障礙物
-    print(f"[ESCAPE] Entering escape sub-loop: Forcing move forward {commit_distance_m}m to commit...")
-    escape_steps = 0
-    
-    # 'obs' 來自上一個轉彎動作
-    if obs is None: # 以防萬一
-         obs = env.step("turn_left"); obs = env.step("turn_right")
+    # --- 2. Backward (Reactive V2) ---
+    print(f"[FSM-BACKWARD] Executing: Adaptive Backward (max {escape_backward_dist}m)")
 
-    max_escape_steps = max(1, int(commit_distance_m / FORWARD_STEP))
-    stuck_pos_during_escape = env.agent.get_state().position.copy()
+    # ========= [Memory BEFORE backward] 記錄撤退前的危險記憶 =========
+    pre_obs = env.sim.get_sensor_observations()
+    pre_depth_main = pre_obs["depth"]
+    h0, w0 = pre_depth_main.shape
+    pre_center_main = pre_depth_main[:, int(w0*0.3):int(w0*0.7)]
+    pre_min_main_dist = float(np.min(pre_center_main))  # 撤退前主相機「最近距離」
 
-    while escape_steps < max_escape_steps:
-        print(f"[ESCAPE] Commit Step {escape_steps+1}/{max_escape_steps}: Moving forward...")
-        obs = env.step("move_forward")
+    # 若有腳部相機，記錄撤退前腳下危險像素數
+    has_foot = ("foot_depth" in pre_obs)
+    if has_foot:
+        pre_depth_foot = pre_obs["foot_depth"]
+        hf0, wf0 = pre_depth_foot.shape
+        pre_center_foot = pre_depth_foot[:, int(wf0*0.3):int(wf0*0.7)]
+        # 你原本用的「地面危險」固定 0.2m，這裡記錄撤退前這個區域內的危險像素數
+        PRE_DANGER_THRESHOLD_FLOOR = 0.2
+        pre_floor_danger_count = int(np.sum(pre_center_foot < PRE_DANGER_THRESHOLD_FLOOR))
+    else:
+        PRE_DANGER_THRESHOLD_FLOOR = 0.2
+        pre_floor_danger_count = 0
+
+    # 針對主相機的「危險記憶」門檻：要求之後掃描到的可走距離必須「同時 ≥ commit_distance_m」且「≥ 撤退前最近距離 + margin」
+    MAIN_MEMORY_MARGIN = 0.05  # 再多給 5cm 緩衝，避免貼邊
+    MAIN_MEMORY_MIN_CLEAR = pre_min_main_dist + MAIN_MEMORY_MARGIN  # 撤退前危險記憶
+    # ===============================================================
+
+    # 強制至少後退 0.2m (或 escape_backward_dist 的一半)
+    min_dist_to_clear = min(0.2, escape_backward_dist * 0.5)
+    min_backward_steps = max(1, int(min_dist_to_clear / FORWARD_STEP))
+    steps_taken = 0
+    obs = None
+    cleared = False
+
+    while steps_taken < min_backward_steps:
+        obs = navigateAndSee(env, "move_backward", target_mask)
+        steps_taken += 1
         
-        # 檢查新觀測
+        current_depth = obs["depth"]
+        near_pixels_front = np.sum(current_depth < 0.1)
+        
+        if near_pixels_front < proactive_avoidance_threshold:
+            cleared = True
+        
+        if cleared and steps_taken >= min_backward_steps:
+            print(f"[FSM-BACKWARD] Backward clear after {steps_taken * FORWARD_STEP:.2f}m.")
+            break
+    else:
+        print(f"[FSM-BACKWARD] Backward max distance reached.")
+        
+    if obs is None:
+        obs = env.sim.get_sensor_observations()
+
+    # === Phase 2: Find & Commit Loop (循環重試) ===
+    # 這是你建議的 while 迴圈
+
+    REQUIRED_CLEAR_DISTANCE = commit_distance_m
+    scan_attempts = 0
+
+    while scan_attempts < 2:  # 最多嘗試 2 次 (例如，左 180 度 + 右 180 度)
+
+        # --- 3. Scan_Turn (Dynamic V2) ---
+        print(f"[FSM-SCAN] Attempt {scan_attempts+1}/2: Scanning {escape_action} until clear for {commit_distance_m} m...")
+        
+        max_turn_steps = int(180 // TURN_ANGLE)  # 每次掃描 180 度
+        found_clear_path = False
+
+        # 關鍵修正：先轉一步，再開始檢查
+        obs = navigateAndSee(env, escape_action, target_mask) ; frame_count += 1
+        for i in range(1, max_turn_steps):
+            # --- 1. 檢查主攝影機 (1.5m 高度) ---
+            current_depth = obs["depth"]
+            h, w = current_depth.shape
+            # 恢復使用合理的中央寬度
+            center_view = current_depth[:, int(w * 0.3):int(w * 0.7)]
+            
+            # 策略檢查：前方是否有足夠 "承諾" 的距離
+            min_clear_distance_main = float(np.min(center_view))
+
+            # ========= [Memory Gating] 用撤退前危險記憶卡住假空間 =========
+            # 必須同時滿足：>= commit_distance_m 且 >= 撤退前最近距離 + margin
+            # 也就是：避免因為「先退」而讓主相機把本來貼牆的方向錯誤判定為安全
+            is_main_cam_clear = (
+                (min_clear_distance_main >= REQUIRED_CLEAR_DISTANCE) and
+                (min_clear_distance_main >= MAIN_MEMORY_MIN_CLEAR)
+            )
+            # ===========================================================
+
+            # --- 2. 檢查腳部攝影機 (0.2m 高度) ---
+            if "foot_depth" in obs:
+                down_depth = obs["foot_depth"]
+                h_f, w_f = down_depth.shape
+                center_foot_view = down_depth[:, int(w_f * 0.3):int(w_f * 0.7)]
+
+                # 地面危險固定絕對閾值（避免矮物）：0.2m
+                # 另外：若撤退前腳下一直有危險像素（pre_floor_danger_count>0），掃描時也要維持「完全無危險像素」才放行
+                floor_count = int(np.sum(center_foot_view < PRE_DANGER_THRESHOLD_FLOOR))
+                is_floor_cam_clear = (floor_count == 0)
+            else:
+                floor_count = 0
+                is_floor_cam_clear = True  # 沒有腳部相機就視為通過
+
+            # --- 3. 決策 ---
+            print(
+                f"[FSM-SCAN DEBUG] deg={i * TURN_ANGLE}: "
+                f"MainCamClear? {is_main_cam_clear} "
+                f"(Dist:{min_clear_distance_main:.2f}m, "
+                f"MemMin:{MAIN_MEMORY_MIN_CLEAR:.2f}m, "
+                f"Req:{REQUIRED_CLEAR_DISTANCE:.2f}m), "
+                f"FloorCamClear? {is_floor_cam_clear} "
+                f"(FloorObstacles:{floor_count}, PreDangerCount:{pre_floor_danger_count})"
+            )
+
+            # 必須「同時」滿足：
+            # 1. 主攝影機看到的路徑 ≥ commit_distance_m 且 ≥ 撤退前危險記憶門檻
+            # 2. 腳部攝影機在 0.2m 危險區內沒有任何東西
+            if is_main_cam_clear and is_floor_cam_clear:
+                print(f"[FSM-SCAN] Found clear path at {i * TURN_ANGLE} deg.")
+                found_clear_path = True
+                break
+            
+            # 如果不滿足，就轉一步
+            obs = navigateAndSee(env, escape_action, target_mask); frame_count += 1
+
+        if not found_clear_path:
+            print(f"[FSM-SCAN] WARN: Scan {escape_action} failed (180 deg).")
+            scan_attempts += 1
+            escape_action = "turn_right" if escape_action == "turn_left" else "turn_left"  # 換邊
+            continue  # 回到 while 迴圈頂部，嘗試反向掃描
+
+
+        # --- 4. Commit (Corrected Logic) ---
+        print(f"[FSM-COMMIT] Path found. Committing forward {commit_distance_m}m...")
+        escape_steps = 0
+        commit_succeeded = False
+        
+        # [!!! 致命 BUG 修正 !!!]
+        # 檢查 "近" 像素，而不是 "遠" 像素
         current_depth = obs["depth"]
         current_near_pixels = np.sum(current_depth < 0.2)
-        
-        # 錄影
-        rgb = obs["rgb"]; mask = target_mask(obs); vis = overlay_mask(rgb, mask)
-        vw.write(cv2.cvtColor(vis, cv2.COLOR_RGB2BGR)); frame_count += 1
-        
-        escape_steps += 1
-        
-        # 檢查在「鞏固時」是否又卡住了 (撞到 *新* 障礙物)
-        if current_near_pixels > proactive_avoidance_threshold:
-            print(f"[ESCAPE] Hit a *new* obstacle during escape commit (near={current_near_pixels})! Aborting commit.")
-            break # 停止 "commit"
-            
-        # 檢查是否物理上卡住
-        new_pos = env.agent.get_state().position
-        if escape_steps > 5 and np.linalg.norm(new_pos - stuck_pos_during_escape) < 0.01:
-            print("[ESCAPE] Physically stuck during escape move! Aborting commit.")
-            break
-        stuck_pos_during_escape = new_pos
-        
-    if escape_steps >= max_escape_steps:
-        print(f"[ESCAPE] Escape commit complete ({commit_distance_m}m).")
-    else:
-        print(f"[ESCAPE] Escape commit cut short after {escape_steps} steps.")
-    # ========== [!!! END OF V9 FIX !!!] ==========
 
-    # --- 10. Return final state ---
+        if current_near_pixels < proactive_avoidance_threshold:
+            max_escape_steps = max(1, int(commit_distance_m / FORWARD_STEP))
+            stuck_pos_during_escape = env.agent.get_state().position.copy()
+
+            for _ in range(max_escape_steps):
+                obs = navigateAndSee(env, "move_forward", target_mask); frame_count += 1
+                escape_steps += 1
+                
+                current_depth = obs["depth"]
+                current_near_pixels = np.sum(current_depth < 0.2)
+                
+                if current_near_pixels > proactive_avoidance_threshold:
+                    print(f"[FSM-COMMIT] FAILED: Hit new obstacle during commit (near={current_near_pixels}).")
+                    break # 停止 "commit"
+                
+                new_pos = env.agent.get_state().position
+                if escape_steps > 5 and np.linalg.norm(new_pos - stuck_pos_during_escape) < 0.01:
+                    print("[FSM-COMMIT] FAILED: Physically stuck during commit.")
+                    break
+                stuck_pos_during_escape = new_pos
+            else:
+                # 'for' 迴圈正常完成 (沒有 break)
+                print(f"[FSM-COMMIT] SUCCESS: Commit complete ({commit_distance_m}m).")
+                commit_succeeded = True
+        else:
+            print(f"[FSM-COMMIT] FAILED: Front is blocked (near={current_near_pixels}). Cannot commit.")
+            
+        # --- 5. FSM Loop Check ---
+        if commit_succeeded:
+            print("[FSM] Escape Successful. Exiting FSM.")
+            return obs, frame_count # 成功！
+        else:
+            print("[FSM] LOOP: Commit failed. Looping back to SCAN_TURN.")
+            # 迴圈將自動繼續，回到 "Scan_Turn" 狀態
+            # 但我們需要換個方向，否則會卡住
+            scan_attempts += 1
+            escape_action = "turn_right" if escape_action == "turn_left" else "turn_left" 
+            
+    # 如果 while 迴圈用盡 (掃描 360 度都失敗了)
+    print("[FSM] PANIC: All scan and commit attempts failed. Escaping failed.")
     return obs, frame_count
 
 def run_navigation_replan(env, binary_map, color_map, bounds, start_pixel_orig, goal_pixel_orig, target_mask,
                         output_video="result_replan.mp4", replan_thresh=0.3, segment_distance_m=1.0,
                         # --- Avoidance Params ---
-                        proactive_avoidance_threshold=5000,
-                        escape_backward_dist=0.5,
-                        escape_turn_angle=30,         # 'Peek' 和 'Turn' 都使用這個角度
-                        escape_commit_distance_m=1.25,
+                        proactive_avoidance_threshold=50,
+                        escape_backward_dist=0.25,
+                        escape_turn_angle=30,         # 'Peek' 使用這個角度
+                        escape_commit_distance_m=0.15,
                         # --- Controller Params ---
                         look_ahead_points=5,
                         turn_threshold_deg=5.0,
@@ -504,7 +673,6 @@ def run_navigation_replan(env, binary_map, color_map, bounds, start_pixel_orig, 
     - Uses new oscillation detection logic.
     - Calls the *same* helper function for *both* proactive avoidance and stuck/oscillation.
     """
-    vw = cv2.VideoWriter(output_video, cv2.VideoWriter_fourcc(*"mp4v"), FPS, (512, 512))
     frame_count = 0
     h, w = binary_map.shape
 
@@ -513,12 +681,10 @@ def run_navigation_replan(env, binary_map, color_map, bounds, start_pixel_orig, 
     initial_path_pixel, _ = rrt_star_planning(binary_map, start_pixel_orig, goal_pixel_orig)
     if initial_path_pixel is None:
         print("[FAIL] Initial RRT* planning failed. Cannot start navigation.")
-        vw.release()
         return
     initial_world_path = [pixel_to_world(u, v, w, h, bounds) for (u, v) in initial_path_pixel]
     if not initial_world_path:
         print("[FAIL] Initial world path is empty. Cannot start navigation.")
-        vw.release()
         return
     subgoals = create_subgoals(initial_world_path, segment_distance_m)
     subgoals = subgoals[1:] # Remove start point
@@ -606,7 +772,7 @@ def run_navigation_replan(env, binary_map, color_map, bounds, start_pixel_orig, 
                     # 呼叫 *更新後* 的脫困函式
                     obs, frame_count = _execute_smart_escape(
                         env, escape_turn_angle, escape_backward_dist, proactive_avoidance_threshold,
-                        vw, target_mask, frame_count, FPS, FORWARD_STEP, TURN_ANGLE,
+                        target_mask, frame_count, FPS, FORWARD_STEP, TURN_ANGLE,
                         commit_distance_m=escape_commit_distance_m # 傳入新參數
                     )
                     
@@ -618,8 +784,8 @@ def run_navigation_replan(env, binary_map, color_map, bounds, start_pixel_orig, 
                 # --- (4) Check Deviation ---
                 dists_all = [math.hypot(px - pos[0], pz - pos[2]) for (px, pz) in current_segment_world_path[progress_idx:]]
                 if not dists_all:
-                     print("[WARN] Path points exhausted but subgoal not reached. Forcing replan.")
-                     break 
+                    print("[WARN] Path points exhausted but subgoal not reached. Forcing replan.")
+                    break 
                 
                 nearest_local_idx = int(np.argmin(dists_all))
                 current_dist_to_path = dists_all[nearest_local_idx]
@@ -665,7 +831,7 @@ def run_navigation_replan(env, binary_map, color_map, bounds, start_pixel_orig, 
                         # 呼叫 *相同* 的脫困函式
                         obs, frame_count = _execute_smart_escape(
                             env, escape_turn_angle, escape_backward_dist, proactive_avoidance_threshold,
-                            vw, target_mask, frame_count, FPS, FORWARD_STEP, TURN_ANGLE,
+                            target_mask, frame_count, FPS, FORWARD_STEP, TURN_ANGLE,
                             commit_distance_m=escape_commit_distance_m
                         )
 
@@ -678,14 +844,8 @@ def run_navigation_replan(env, binary_map, color_map, bounds, start_pixel_orig, 
                 # ========== [!!! END OF V9 FIX !!!] ==========
 
                 # --- (7) Execute Action & Record Video ---
-                obs = env.step(action_to_take) # CRITICAL: Get obs for *next* loop's check
-
-                rgb = obs["rgb"]
-                mask = target_mask(obs)
-                vis = overlay_mask(rgb, mask)
-                for sub in range(FPS//15):
-                    vw.write(cv2.cvtColor(vis, cv2.COLOR_RGB2BGR))
-                    frame_count += 1
+                obs = navigateAndSee(env, action_to_take, target_mask)
+                frame_count += 1
 
             # --- Inner loop finished ---
 
@@ -699,13 +859,13 @@ def run_navigation_replan(env, binary_map, color_map, bounds, start_pixel_orig, 
                 global_replan_count += 1
                 local_replan_count_this_segment += 1
                 if local_replan_count_this_segment > 10:
-                     print(f"[FAIL] Replan limit exceeded for subgoal {current_subgoal_index}. Aborting.")
-                     return
+                    print(f"[FAIL] Replan limit exceeded for subgoal {current_subgoal_index}. Aborting.")
+                    return
 
         # --- Outer loop finished (all subgoals reached) ---
         
         print("[INFO] All subgoals completed. Executing final turn to goal...")
-        face_goal(env, goal_pixel_orig, bounds, w, h, vw, target_mask, FPS)
+        face_goal(env, goal_pixel_orig, bounds, w, h, target_mask, FPS)
 
     except KeyboardInterrupt:
         print("\n[INTERRUPT] User interrupted. Saving video...")
@@ -716,92 +876,139 @@ def run_navigation_replan(env, binary_map, color_map, bounds, start_pixel_orig, 
         print("[CRITICAL] Saving current video and exiting.")
     finally:
         # --- Cleanup ---
-        if vw is not None and vw.isOpened():
-             vw.release()
-             print(f"[SAVE] Video safely saved ({frame_count} frames)")
+        cv2.destroyAllWindows()
+        print(f"[END] Navigation finished.")
+        print(f"[SAVE] Video safely saved ({frame_count} frames)")
         try:
-             env.sim.close()
-             print("[CLEANUP] Simulator closed.")
+            env.sim.close()
+            print("[CLEANUP] Simulator closed.")
         except Exception as e_close:
-             print(f"[WARN] Error closing simulator: {e_close}")
+            print(f"[WARN] Error closing simulator: {e_close}")
 
     print(f"[END] Navigation finished after {global_replan_count} total replan rounds.")
 
-
-
 # ==========================================================
-# 主程式 (基於 V1 修改)
+# 主程式
 # ==========================================================
 if __name__ == "__main__":
     
     print("=== HW2 Part3 (V3 - 統一控制器版本) ===")
-
+    DPI = 300
     currdir = os.path.dirname(os.path.abspath(__file__))
-    MAP_PATH = os.path.join(currdir, "map.png")
+    MAP_PATH = os.path.join(currdir, f"map{DPI}.png")
     EXCEL_PATH = os.path.join(
         currdir, "color_coding_semantic_segmentation_classes.xlsx")
     BOUNDS_PATH = os.path.join(currdir, "coordinate_bounds.json")
     OUTPUT_PATH = "./part3OUTPUT"
     os.makedirs(OUTPUT_PATH, exist_ok=True)
     
+    # 讀地圖並二值化（白=free=255，黑=obs=0）
+    map_img_gray = cv2.imread(MAP_PATH, cv2.IMREAD_GRAYSCALE)
+    if map_img_gray is None:
+        raise FileNotFoundError(MAP_PATH)
+    _, binary_map = cv2.threshold(map_img_gray, 240, 255, cv2.THRESH_BINARY)
+
+    # Step 1. 載入語意表與地圖 (略)
     color_map = load_semantic_table(EXCEL_PATH)
     id_map = load_semantic_ID_table(EXCEL_PATH)
-    
-    # 測試用例
-    TARGET_CLASS = "window"
-    goal, mask = find_object_region(MAP_PATH, color_map, TARGET_CLASS)
-    start = (335, 240) # 複雜繞行
-    # start = (212, 428) # 直線
+    map_img = cv2.imread(MAP_PATH)
+    if map_img is None:
+        raise FileNotFoundError(f"❌ 找不到地圖: {MAP_PATH}")
 
-    map_gray = cv2.imread(MAP_PATH, cv2.IMREAD_GRAYSCALE)
-    _, binary_map = cv2.threshold(map_gray, 240, 255, cv2.THRESH_BINARY)
+    # Step 2. 掃描地圖中實際出現的顏色
+    unique_colors = np.unique(map_img.reshape(-1, 3), axis=0)
+    unique_colors_set = {tuple(color.tolist()) for color in unique_colors}
+    available_classes = []
+    for name, rgb in color_map.items():
+        bgr = tuple(reversed(rgb))
+        if bgr in unique_colors_set:
+            available_classes.append(name)
+    if not available_classes:
+        raise RuntimeError("❌ map.png 找不到任何語意類別，請確認顏色與語意表一致。")
+    print(f"[INFO] 可用的目標類別（出現在地圖上）：{available_classes}")
+
+    # Step 3. 讓使用者輸入目標並選起點
+    target_class = input(f"請輸入目標類別 {available_classes}: ").strip().lower()
+    if target_class not in available_classes:
+        raise ValueError(f"⚠️ '{target_class}' 不在地圖可用清單中。")
+    goals_list,goal_mask = find_all_object_instances(MAP_PATH, color_map, target_class)
+
+    if not goals_list or goal_mask is None: 
+        raise ValueError(f"⚠️ 找不到目標類別 '{target_class}' 的任何區域。")
     
-    
-    # --- ✅ 步驟 1: 全域路徑規劃 (只執行一次) ---
-    path, _ = rrt_star_planning(binary_map, start, goal,SAFE_WEIGHT=500000)
-    if path is None:
-        print("❌ 無法找到初始可行路徑。")
-        exit()
+    print(f"[INFO] 將 {target_class} 區域 (來自 color map) 合併到可行走地圖 (binary_map) 中...")
+    binary_map_with_goal = cv2.bitwise_or(binary_map, goal_mask)
+    # visualize_multiple_goals(MAP_PATH, goals_list, target_class)     # 顯示所有找到的窗戶
+
+    # TODO: 未來您可以修改這裡，例如讓使用者點選，或自動找最近的。
+    while True:
+        goal_idx = input(f"請輸入要找第幾個窗戶（1～{len(goals_list)}，只能輸入一個數字）: ")
+
+        # 檢查是否為純數字且範圍正確
+        if goal_idx.isdigit():
+            goal_idx = int(goal_idx)
+            if 1 <= goal_idx <= len(goals_list):
+                break
+            else:
+                print(f"⚠️ 請輸入 1～{len(goals_list)} 之間的數字。")
+        else:
+            print("⚠️ 無效輸入，請輸入數字。")
+
+    goal = goals_list[goal_idx - 1]
+    print(f"[INFO] 已自動選擇 {len(goals_list)} 個目標中的第 1 個: {goal} 作為 RRT* 終點。")
+
+    # 挑選起點 執行 RRT* 
+    start = select_start(MAP_PATH, goal)
+    path, nodes = rrt_star_planning(binary_map_with_goal, start, goal, SAFE_WEIGHT=500000)
+
+    # 顯示結果
+    if path:
+        print(f"[INFO] 路徑長度（像素）: {path_length_px(path):.1f} | 節點數: {len(nodes)}")
+        result_img = cv2.cvtColor(binary_map, cv2.COLOR_GRAY2BGR)
+        for i in range(len(path) - 1):
+            p1 = (int(path[i][0]), int(path[i][1]))
+            p2 = (int(path[i + 1][0]), int(path[i + 1][1]))
+            cv2.line(result_img, p1, p2, (0, 0, 255), 2)
+        out = f"rrt_star_result_{target_class}.png"
+        cv2.imwrite(out, result_img)
+        print(f"[INFO] 結果已儲存至 {out}")
+    else:
+        print("[INFO] 無路徑產生")
+
+    visualize_rrt(binary_map, nodes, start, goal, path)
 
     bounds = load_bounds(BOUNDS_PATH)
     h, w, _ = cv2.imread(MAP_PATH).shape
     
     world_path = [pixel_to_world(u, v, w, h, bounds) for (u, v) in path]
-    world_path = simplify_path(world_path, min_step=0.25) # 簡化路徑點
+    # world_path = simplify_path(world_path, min_step=0.25) # 簡化路徑點
     print(f"[INFO] 初始全域路徑: {len(path)} 點 -> 簡化為 {len(world_path)} 點")
     
     # --- Habitat 環境 ---
     sim_settings = {
-        "scene": "/home/clu98753cs13/Desktop/course/phyai/physical-ai25/hw0/replica_v1/apartment_0/habitat/mesh_semantic.ply",
+        "scene": "/home/clu98753cs13/Desktop/course/phyai/physical-ai25/hw2/replica_v1/apartment_0/habitat/mesh_semantic.ply",
         "default_agent": 0,
         "sensor_height": 1.5,
+        "sensor_foot_height": 0.2,
         "width": 512,
         "height": 512,
         "sensor_pitch": 0,
     }
 
-    # --- Target Mask 函數 (保持不變) ---
-    def hex_to_rgb(hex_color):
-        hex_color = hex_color.strip().lower().replace('0x', '').replace('#', '')
-        if len(hex_color) != 6: raise ValueError(f"❌ 無效的 hex 色碼: {hex_color}")
-        return tuple(int(hex_color[i:i+2], 16) for i in (0, 2, 4))
-
-    def target_mask(obs):
-        semantic_img = obs["semantic"]
-        target_id = id_map[TARGET_CLASS.lower()] % 40
-        target_rgb = hex_to_rgb(d3_40_colors_hex[target_id])
-        mask = cv2.inRange(semantic_img, target_rgb, target_rgb)
-        return (mask > 0).astype(np.uint8)
-
     # === ✅ 步驟 2: 啟動環境與 Agent ===
     env = HabitatEnvWrapper(sim_settings)
     
-    # 設置初始位置
+    # 建立視窗
+    cv2.namedWindow("Navigation (Overlay)", cv2.WINDOW_AUTOSIZE)
+    # cv2.namedWindow("Depth (Debug)", cv2.WINDOW_AUTOSIZE)
+    # cv2.namedWindow("Semantic (Debug)", cv2.WINDOW_AUTOSIZE) # 語義通常太雜亂，可選
+
+
+    # 設置初始位置 初始朝向 (面向路徑的第二個點)
     start_x, start_z = pixel_to_world(start[0], start[1], w, h, bounds)
     state = habitat_sim.AgentState()
     state.position = np.array([start_x, 0, start_z])
     
-    # 設置初始朝向 (面向路徑的第二個點)
     dx = world_path[1][0] - world_path[0][0]
     dz = world_path[1][1] - world_path[0][1]
     init_yaw = math.atan2(-dx, -dz) 
@@ -812,18 +1019,19 @@ if __name__ == "__main__":
     print(f"[INFO] Agent placed at {state.position}, yaw = {math.degrees(init_yaw):.2f}°")
 
     # === ✅ 步驟 3: 執行 V3 統一控制器 ===
-    video_path = f"{OUTPUT_PATH}/{TARGET_CLASS}_V3_controller.mp4"
+    video_path = f"{OUTPUT_PATH}/{target_class}_V3_controller.mp4"
     run_navigation_replan(env, binary_map, color_map, bounds, start, goal, target_mask,
-                output_video="result_replan.mp4", replan_thresh=0.3, segment_distance_m=1.0,
+                output_video=video_path, replan_thresh=0.3, segment_distance_m=1.0,
                 # --- 避障參數 ---
-                proactive_avoidance_threshold=5000,
+                proactive_avoidance_threshold=50,
                 escape_backward_dist=0.5,
+                escape_commit_distance_m=0.15,
                 escape_turn_angle=45,
                 # --- 新增：控制器參數 ---
                 look_ahead_points=5,       # Pure Pursuit: 預瞄路徑上未來第幾個點
                 turn_threshold_deg=5.0,    # 角度偏差 > 5° 才轉彎
-                stuck_threshold=20)
+                stuck_threshold=5)
 
-    visualize_path_on_map(MAP_PATH, path, goal, start, TARGET_CLASS, OUTPUT_PATH, save_prefix="rrt_result_V3_initial")
+    visualize_path_on_map(MAP_PATH, path, goal, start, target_class, OUTPUT_PATH, save_prefix="rrt_result_V3_initial")
     env.sim.close()
     print(f"[✅ DONE] V3 導航影片與地圖已輸出至 {OUTPUT_PATH}/")
