@@ -80,7 +80,9 @@ plt.title("2D Semantic Map of apartment_0 First Floor (X-Z Projection)")
 # 步驟 4: 儲存地圖
 # 儲存地圖為 "map.png" [cite: 24]
 # bbox_inches='tight' 和 pad_inches=0 確保只儲存點雲的部分，沒有多餘白邊
-plt.savefig("map.png", bbox_inches='tight', pad_inches=0)
+
+DPI = 100
+plt.savefig(f"map{DPI}.png", bbox_inches='tight', pad_inches=0,dpi=DPI)
 
 plt.show()
 
