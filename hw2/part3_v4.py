@@ -148,38 +148,35 @@ def target_mask(obs):
     return (mask > 0).astype(np.uint8)
 
 
-def navigateAndSee(env_instance, action, target_mask_func):
+def navigateAndSee(env_instance, action, target_mask_func, video_writer=None):
     """
     執行一步、即時顯示觀測，並返回觀測值。
     """
-    # 1. 執行 Wrapper 的 step
-    # 這會返回處理過的 {"rgb":..., "depth":..., "semantic":...}
     observations = env_instance.step(action)
 
-    # 2. 準備主顯示 (使用 V3 的 overlay_mask 函數)
+    # 準備合成顯示 (使用 overlay_mask 函數)
     rgb_img = observations["rgb"]
     mask = target_mask_func(observations) # 呼叫 target_mask
     vis_img = overlay_mask(rgb_img, mask) # 合成遮罩
-
-    # 3. 顯示所有觀測
     cv2.imshow("Navigation (Overlay)", transform_rgb_bgr(vis_img))
     # cv2.imshow("Depth (Debug)", transform_depth(observations["depth"]))
     # cv2.imshow("Semantic (Debug)", transform_rgb_bgr(observations["semantic"]))
 
-    # 4. 顯示攝影機姿態 (來自您的程式碼)
-    agent_state = env_instance.agent.get_state()
-    sensor_state = agent_state.sensor_states['color_sensor']
+    # 顯示攝影機姿態 (來自您的程式碼)
+    # agent_state = env_instance.agent.get_state()
+    # sensor_state = agent_state.sensor_states['color_sensor']
     # print("camera pose: x y z rw rx ry rz")
     # print(sensor_state.position[0],...) # (建議註解掉, 否則 log 會爆炸)
 
-    # 5. 刷新視窗 (!!!! 關鍵中的關鍵 !!!!)
-    # 沒有這行, 圖片不會更新
+    if video_writer is not None:
+        frame_resized = cv2.resize(transform_rgb_bgr(vis_img), (512, 512))
+        video_writer.write(frame_resized)
+
+    # 5. 刷新視窗 (!!!! 關鍵中的關鍵 !!!!)沒有這行, 圖片不會更新
     key = cv2.waitKey(1) & 0xFF
     if key == ord('q'): # 允許按 'q' 提早結束
         raise KeyboardInterrupt("User pressed 'q' to quit.")
 
-    # 6. 返回觀測值 (!!!! 關鍵 !!!!)
-    # 主導航邏輯 (run_navigation_replan) 需要這個 obs 來檢查深度
     return observations
 
 
@@ -325,7 +322,7 @@ def overlay_mask(rgb, mask, color=(255, 0, 0), alpha=0.15):
     dst = cv2.addWeighted(color_mask, alpha, rgb, 1 - alpha, 0)
     return dst
 
-def face_goal(env, goal, bounds, w, h, target_mask, FPS=120, TURN_ANGLE=1):
+def face_goal(video_writer,env, goal, bounds, w, h, target_mask, FPS=120, TURN_ANGLE=1):
     """
     抵達目標後, 旋轉朝向目標並結束錄影。
     """
@@ -345,9 +342,9 @@ def face_goal(env, goal, bounds, w, h, target_mask, FPS=120, TURN_ANGLE=1):
 
     if turn_steps > 0:
         for i in range(turn_steps):
-            obs = navigateAndSee(env, turn_action, target_mask)
+            obs = navigateAndSee(env, turn_action, target_mask,video_writer)
     else:
-        obs = navigateAndSee(env, "turn_left", target_mask)
+        obs = navigateAndSee(env, "turn_left", target_mask,video_writer)
 
     # ( ... 結尾動畫 ... )
     rgb = obs["rgb"].copy()
@@ -356,6 +353,11 @@ def face_goal(env, goal, bounds, w, h, target_mask, FPS=120, TURN_ANGLE=1):
     vis = end_anime(vis)
     vis_bgr = transform_rgb_bgr(vis)
     cv2.imshow("Navigation (Overlay)", vis_bgr)
+    if video_writer is not None:
+        # 寫入約 3 秒動畫（FPS x 3 幀）
+        for _ in range(int(FPS * 3)):
+            video_writer.write(cv2.resize(vis_bgr, (512, 512)))
+
     print(f"[END] Navigation finished with facing target. Displaying final frame...")
     cv2.waitKey(3000)
 
@@ -664,6 +666,7 @@ def run_navigation(env,
                 target_mask_func,     # target_mask
                 goal_pixel,           # 最終目標（像素）
                 w, h,                 # 地圖寬高
+                video_writer=None,
                 lookahead_m=0.2,      # 已改為動態 Ld，這個參數不再直接使用
                 turn_on_deg=8.0,
                 turn_off_deg=3.0,
@@ -725,7 +728,7 @@ def run_navigation(env,
     def do_steps(act, n):
         nonlocal actions, obs
         for _ in range(max(0, int(n))):
-            obs = navigateAndSee(env, act, target_mask_func)
+            obs = navigateAndSee(env, act, target_mask_func,video_writer)
             actions += 1
 
     while actions < max_actions:
@@ -737,7 +740,7 @@ def run_navigation(env,
 
         # 抵達檢查（朝最終世界座標）
         if math.hypot(P[0]-goalx, P[1]-goalz) < arrival_thresh:
-            face_goal(env, goal_pixel, bounds, w, h, target_mask_func)
+            face_goal(video_writer,env, goal_pixel, bounds, w, h, target_mask_func)
             print("[DONE] Arrived goal.")
             return
 
@@ -773,7 +776,7 @@ def run_navigation(env,
                     forward_dir = np.array([-math.sin(yaw), 0.0, -math.cos(yaw)], dtype=np.float32)
                     candidate = pos + forward_dir * float(FORWARD_STEP)
                     if env.sim.pathfinder.is_navigable(candidate):
-                        obs = navigateAndSee(env, "move_forward", target_mask_func)
+                        obs = navigateAndSee(env, "move_forward", target_mask_func,video_writer)
                     else:
                         # 前面真的走不了，就先結束逃脫，交回主控
                         break
@@ -831,7 +834,7 @@ def run_navigation(env,
             act = pick_turn_action(alpha)
             for _ in range(TURN_BATCH):
                 if actions >= max_actions: break
-                obs = navigateAndSee(env, act, target_mask_func)
+                obs = navigateAndSee(env, act, target_mask_func,video_writer)
                 actions += 1
             if angle_deg < TURN_OFF:
                 turn_state = None
@@ -841,7 +844,7 @@ def run_navigation(env,
                 # 不貿然前進，僅微轉。動態 Ld 已縮短。
                 act = pick_turn_action(alpha)
                 if actions < max_actions:
-                    obs = navigateAndSee(env, act, target_mask_func)
+                    obs = navigateAndSee(env, act, target_mask_func,video_writer)
                     actions += 1
                 step_consumed = True
             else:
@@ -854,15 +857,15 @@ def run_navigation(env,
                     if not env.sim.pathfinder.is_navigable(candidate):
                         # 前一步無法走，改為微轉
                         act = pick_turn_action(alpha)
-                        obs = navigateAndSee(env, act, target_mask_func)
+                        obs = navigateAndSee(env, act, target_mask_func,video_writer)
                     else:
-                        obs = navigateAndSee(env, "move_forward", target_mask_func)
+                        obs = navigateAndSee(env, "move_forward", target_mask_func,video_writer)
                     actions += 1
                 step_consumed = True
 
         if not step_consumed:
             # 保底（理論上不會走到）
-            obs = navigateAndSee(env, "move_forward", target_mask_func)
+            obs = navigateAndSee(env, "move_forward", target_mask_func,video_writer)
             actions += 1
 
         # === 進度型卡住偵測 → rejoin 到前方可視點 ===
@@ -1053,6 +1056,11 @@ if __name__ == "__main__":
     init_yaw = math.atan2(-dx, -dz) 
 
     env.reset_to([start_x, 0.0, start_z], init_yaw)
+    
+    # 影片
+    fourcc = cv2.VideoWriter_fourcc(*'mp4v')  # 編碼器
+    video_path = os.path.join(OUTPUT_PATH, f"{target_class}_navigation.mp4")
+    video_writer = cv2.VideoWriter(video_path, fourcc, FPS, (512, 512))  # (width, height)
 
     # === 執行控制 ===
     video_path = f"{OUTPUT_PATH}/{target_class}_V3_controller.mp4"
@@ -1062,6 +1070,7 @@ if __name__ == "__main__":
     bounds=bounds,
     target_mask_func=target_mask,
     goal_pixel=goal,
+    video_writer=video_writer,
     w=w, h=h,
     lookahead_m=0.05,      # 可調：0.3~0.8 視路徑密度
     turn_on_deg=8.0,
@@ -1074,4 +1083,7 @@ if __name__ == "__main__":
 
     visualize_path_on_map(MAP_PATH, path, goal, start, target_class, OUTPUT_PATH, save_prefix="rrt_result_V3_initial")
     env.sim.close()
+    video_writer.release()
+    cv2.destroyAllWindows()
+    print(f"[🎥 SAVED] Navigation video saved at {video_path}")
     print(f"[✅ DONE] V3 導航影片與地圖已輸出至 {OUTPUT_PATH}/")
