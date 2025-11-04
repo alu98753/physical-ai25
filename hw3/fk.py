@@ -152,8 +152,8 @@ def your_fk(DH_params : dict, q : list or tuple or np.ndarray, base_pos) -> np.n
 
     # adjustment don't touch
     adjustment = np.asarray([[ 0, -1,  0],
-                             [ 0,  0,  0],
-                             [ 0,  0, -1]])
+                            [ 0,  0,  0],
+                            [ 0,  0, -1]])
     A[:3, :3] = A[:3,:3]@adjustment
     pose_7d = np.asarray(get_pose_from_matrix(A,7))
 
