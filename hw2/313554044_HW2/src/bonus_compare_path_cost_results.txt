@@ -1,0 +1,90 @@
+=== Path Cost & Time Comparison (Average over 10 runs per target) ===
+
+
+=== Target: BIKE ((324.0, 655.0)) ===
+[RRT]
+  cost_avg = 797.93, min = 702.57, max = 897.12
+  var = 4097.30, std = 64.01
+  time_avg = 0.02s, min = 0.02s, max = 0.03s, std = 0.01s
+[RRT*]
+  cost_avg = 507.68, min = 507.68, max = 507.68
+  var = 0.00, std = 0.00
+  time_avg = 6.52s, min = 6.46s, max = 6.60s, std = 0.05s
+✅ 改善率: 36.38% | ⏱️ 時間比 RRT*/RRT = 289.85x
+
+=== Target: WINDOW ((199.0, 404.0)) ===
+[RRT]
+  cost_avg = 441.25, min = 378.12, max = 619.19
+  var = 6677.40, std = 81.72
+  time_avg = 0.03s, min = 0.02s, max = 0.04s, std = 0.01s
+[RRT*]
+  cost_avg = 355.52, min = 355.52, max = 355.52
+  var = 0.00, std = 0.00
+  time_avg = 6.45s, min = 6.12s, max = 6.74s, std = 0.21s
+✅ 改善率: 19.43% | ⏱️ 時間比 RRT*/RRT = 257.80x
+
+=== Target: BLINDS ((187, 458)) ===
+[RRT]
+  cost_avg = 492.94, min = 422.09, max = 699.56
+  var = 7638.51, std = 87.40
+  time_avg = 0.03s, min = 0.01s, max = 0.04s, std = 0.01s
+[RRT*]
+  cost_avg = 401.76, min = 401.76, max = 401.76
+  var = 0.00, std = 0.00
+  time_avg = 6.33s, min = 6.23s, max = 6.74s, std = 0.15s
+✅ 改善率: 18.50% | ⏱️ 時間比 RRT*/RRT = 219.55x
+
+=== Target: CABINET ((491.0, 185.0)) ===
+[RRT]
+  cost_avg = 43.82, min = 34.51, max = 53.39
+  var = 41.18, std = 6.42
+  time_avg = 0.00s, min = 0.00s, max = 0.00s, std = 0.00s
+[RRT*]
+  cost_avg = 32.45, min = 32.45, max = 32.45
+  var = 0.00, std = 0.00
+  time_avg = 0.24s, min = 0.23s, max = 0.24s, std = 0.00s
+✅ 改善率: 25.95% | ⏱️ 時間比 RRT*/RRT = 597.94x
+
+=== Target: CHAIR ((373.0, 496.0)) ===
+[RRT]
+  cost_avg = 500.85, min = 384.74, max = 680.51
+  var = 8480.99, std = 92.09
+  time_avg = 0.01s, min = 0.01s, max = 0.02s, std = 0.01s
+[RRT*]
+  cost_avg = 341.35, min = 341.35, max = 341.35
+  var = 0.00, std = 0.00
+  time_avg = 6.14s, min = 6.08s, max = 6.21s, std = 0.04s
+✅ 改善率: 31.85% | ⏱️ 時間比 RRT*/RRT = 423.28x
+
+=== Target: CUP ((306.0, 551.0)) ===
+[RRT]
+  cost_avg = 622.42, min = 468.76, max = 835.15
+  var = 10039.50, std = 100.20
+  time_avg = 0.02s, min = 0.01s, max = 0.02s, std = 0.00s
+[RRT*]
+  cost_avg = 415.23, min = 415.23, max = 415.23
+  var = 0.00, std = 0.00
+  time_avg = 6.29s, min = 6.25s, max = 6.35s, std = 0.03s
+✅ 改善率: 33.29% | ⏱️ 時間比 RRT*/RRT = 385.35x
+
+=== Target: CHSUION ((317.0, 50.0)) ===
+[RRT]
+  cost_avg = 213.36, min = 193.60, max = 241.14
+  var = 192.68, std = 13.88
+  time_avg = 0.02s, min = 0.01s, max = 0.03s, std = 0.01s
+[RRT*]
+  cost_avg = 187.88, min = 187.88, max = 187.88
+  var = 0.00, std = 0.00
+  time_avg = 0.35s, min = 0.34s, max = 0.35s, std = 0.00s
+✅ 改善率: 11.94% | ⏱️ 時間比 RRT*/RRT = 20.19x
+
+=== Target: COOKTOP ((306.0, 551.0)) ===
+[RRT]
+  cost_avg = 626.44, min = 506.51, max = 765.45
+  var = 8379.33, std = 91.54
+  time_avg = 0.02s, min = 0.01s, max = 0.02s, std = 0.00s
+[RRT*]
+  cost_avg = 415.23, min = 415.23, max = 415.23
+  var = 0.00, std = 0.00
+  time_avg = 6.31s, min = 6.26s, max = 6.36s, std = 0.03s
+✅ 改善率: 33.72% | ⏱️ 時間比 RRT*/RRT = 364.97x

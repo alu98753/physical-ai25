@@ -31,11 +31,6 @@ pcd_filtered.colors = o3d.utility.Vector3dVector(filtered_colors)
 
 o3d.visualization.draw_geometries([pcd_filtered])
 
-
-# 步驟 1 & 2: 準備 XZ 座標和顏色
-# 選擇 X 座標 (第一列) 和 Z 座標 (第三列)
-# 注意：在許多 3D 座標系中，Z 軸通常代表深度或高度。但在 2D 俯視圖中，我們通常使用 X 和 Y 軸。
-# 依照作業要求，我們使用 (X, Z) 繪圖 。
 x_coords = filtered_points[:, 0]
 z_coords = filtered_points[:, 2]
 
@@ -51,13 +46,8 @@ OUTPUT_FILENAME = "coordinate_bounds.json"
 with open(OUTPUT_FILENAME,'w',encoding='utf-8') as f:
     json.dump(data, f, indent=4)
 
-# 步驟 3: 繪製散點圖
-# 為了讓地圖看起來更像俯視圖，你可以將 Z 座標視為 Y 座標。
-
 plt.figure(figsize=(10, 10))
 
-# 繪製散點圖: (X, Z) with 顏色
-# s=1 讓點非常小，模擬像素。marker='.' 確保點是圓點。
 plt.scatter(
     x_coords, 
     z_coords, # 投影到 XZ 平面
@@ -66,17 +56,11 @@ plt.scatter(
     marker='.'
 )
 
-# 設置座標軸：
-# 確保 X 和 Z 的比例尺一致，防止地圖變形
 plt.axis('equal') 
-# 移除座標軸刻度，讓它看起來更像地圖
 plt.axis('off') 
-# 設置標題（可選）
 plt.title("2D Semantic Map of apartment_0 First Floor (X-Z Projection)")
 
-# 步驟 4: 儲存地圖
-# 儲存地圖為 "map.png" [cite: 24]
-# bbox_inches='tight' 和 pad_inches=0 確保只儲存點雲的部分，沒有多餘白邊
+# 儲存地圖
 
 DPI = 100
 plt.savefig(f"map{DPI}.png", bbox_inches='tight', pad_inches=0,dpi=DPI)
@@ -85,9 +69,6 @@ plt.show()
 
 print("2D semantic map saved as map.png")
 
-# ==========================================================
-# 步驟 4: 額外輸出 map_minmax.png
-# ==========================================================
 plt.figure(figsize=(10, 10))
 plt.scatter(
     x_coords,
@@ -100,19 +81,15 @@ plt.axis('equal')
 plt.axis('off')
 plt.title("2D Semantic Map (with min/max boundary)")
 
-# 取四個角點
+# 取四個角點 四個角的座標 (x, z)
 xmin, xmax = data["xmin"], data["xmax"]
 zmin, zmax = data["zmin"], data["zmax"]
-
-# 四個角的座標 (x, z)
 corner_points = [
     (xmin, zmin),  # 左下
     (xmin, zmax),  # 左上
     (xmax, zmin),  # 右下
     (xmax, zmax),  # 右上
 ]
-
-# 畫出矩形邊界框
 plt.plot(
     [xmin, xmin, xmax, xmax, xmin],
     [zmin, zmax, zmax, zmin, zmin],
@@ -121,7 +98,6 @@ plt.plot(
     label="Min-Max Bounds"
 )
 
-# 在角點上標記小紅點
 for (x, z) in corner_points:
     plt.scatter(x, z, c='red', s=10)
     plt.text(x, z, f"({x:.2f},{z:.2f})", color='red', fontsize=6)
@@ -129,6 +105,6 @@ for (x, z) in corner_points:
 plt.legend()
 plt.savefig("map_minmax.png", bbox_inches='tight', pad_inches=0)
 plt.close()
-print("✅ map_minmax.png saved (with boundary box and coordinates)")
+print("map_minmax.png saved (with boundary box and coordinates)")
 
 plt.show()

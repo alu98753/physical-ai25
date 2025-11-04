@@ -1,3 +1,4 @@
+# part3_v4_backup.py 保留所有多餘程式的v4版本
 import os
 import cv2
 import math
@@ -8,10 +9,11 @@ from habitat_sim.utils.common import d3_40_colors_rgb, d3_40_colors_hex
 from PIL import Image
 import matplotlib.pyplot as plt
 from habitat_sim.utils.common import quat_from_angle_axis
-from collections import deque
-from rrt_star import *
-# from part2 import *
 
+# 確保 rrt_star.py 就在旁邊
+from rrt_star import *
+# 確保 part2.py 就在旁邊 (或您已將 rrt_star.py 獨立出來)
+# from part2 import *
 # ==========================================================
 # Habitat 環境封裝
 # ==========================================================
@@ -20,8 +22,16 @@ ARRIVAL_JUDGE = FORWARD_STEP*1.5
 TURN_ANGLE = 1
 MAX_ACTIONS = 5000
 FPS = 120
-ARRIVAL_THRESH = 0.25 # 抵達目標的距離閾值 (米)
+ARRIVAL_THRESH = 1 # 抵達目標的距離閾值 (米)
+
+# === V3 控制器參數 ===
+LOOKAHEAD_DISTANCE = 0.2        # (米) Pure Pursuit "胡蘿蔔" 的前瞻距離
+OBSTACLE_CLEARANCE_DIST = 0.2  # (米) 認定為障礙物的深度閾值
+PROACTIVE_THRESH_PIXELS = 3000  # (像素) 觸發主動避障的像素數量閾值
+CORRECTION_ANGLE_THRESH = 2.0   # (度) 循跡時的角度容忍範圍
+STUCK_LIMIT = 100               # (幀) 卡住/震盪多少幀後觸發「最後手段」
 ESCAPE_BACKWARD_DIST = 0.2      # (米) 最後手段：後退距離
+ESCAPE_TURN_ANGLE = 45          # (度) 最後手段：轉向角度
 
 class HabitatEnvWrapper:
     def __init__(self, sim_settings, floor=1):
@@ -32,13 +42,11 @@ class HabitatEnvWrapper:
 
     def reset_to(self, position, yaw_rad=0.0):
         state = habitat_sim.AgentState()
-        # snapped = self.sim.pathfinder.snap_point(np.array(position, dtype=np.float32))
-        state.position = np.array(position, dtype=np.float32)
+        snapped = self.sim.pathfinder.snap_point(np.array(position, dtype=np.float32))
+        state.position = snapped
         state.rotation = quat_from_angle_axis(yaw_rad, np.array([0.0, 1.0, 0.0], dtype=np.float32))
-        self.agent.set_state(state, reset_sensors=True)
-        _ = env.sim.get_sensor_observations()
-
-        print(f"[RESET] Agent snapped to navmesh: {position}, yaw={math.degrees(yaw_rad):.1f}°")
+        self.agent.set_state(state)
+        print(f"[RESET] Agent snapped to navmesh: {snapped}, yaw={math.degrees(yaw_rad):.1f}°")
 
     def make_simple_cfg(self, settings):
         sim_cfg = habitat_sim.SimulatorConfiguration()
@@ -141,6 +149,7 @@ def target_mask(obs):
     mask = cv2.inRange(semantic_img, target_rgb, target_rgb)
     return (mask > 0).astype(np.uint8)
 
+
 def navigateAndSee(env_instance, action, target_mask_func, video_writer=None):
     """
     執行一步、即時顯示觀測，並返回觀測值。
@@ -177,6 +186,16 @@ def load_bounds(json_path):
     with open(json_path, "r") as f:
         data = json.load(f)
     return data["xmin"], data["xmax"], data["zmin"], data["zmax"]
+
+# ( ... distance_to_path, pixel_to_world, world_to_pixel 保持不變 ... )
+def distance_to_path(current_pos, path):
+    """回傳 agent 到當前路徑上最近點的距離"""
+    if not path:
+        return np.inf
+    pxz = np.array([[px, pz] for px, pz in path])
+    pos_xz = np.array([current_pos[0], current_pos[2]])
+    dists = np.linalg.norm(pxz - pos_xz, axis=1)
+    return np.min(dists)
 
 def pixel_to_world(u, v, w, h, bounds):
     SCALE_FACTOR = 10000 / 255 
@@ -351,6 +370,38 @@ def end_anime(rgb):
     cv2.putText(vis, text, (text_x, text_y), font, font_scale, (0, 255, 0), thickness, cv2.LINE_AA)
     return vis
 
+def create_subgoals(world_path, segment_distance_m=1.0):
+    """
+    從完整的 world_path 中，每隔約 segment_distance_m 選取一個點作為子目標。
+    """
+    if not world_path or len(world_path) < 2:
+        return world_path # 如果路徑很短，直接返回
+
+    subgoals = [world_path[0]] # 包含起點
+    accumulated_dist = 0.0
+    
+    for i in range(len(world_path) - 1):
+        p1 = world_path[i]
+        p2 = world_path[i+1]
+        segment_dist = math.hypot(p2[0] - p1[0], p2[1] - p1[1])
+        accumulated_dist += segment_dist
+
+        # 如果累積距離超過閾值，且不是最後一段
+        if accumulated_dist >= segment_distance_m and i < len(world_path) - 2:
+            subgoals.append(p2)
+            accumulated_dist = 0.0 # 重置累積距離
+
+    # 確保最終目標點一定在列表中
+    if subgoals[-1] != world_path[-1]:
+        subgoals.append(world_path[-1])
+        
+    print(f"[INFO] 分而治之：從 {len(world_path)} 個路徑點中，生成 {len(subgoals)} 個子目標點。")
+    # 打印子目標點以供調試
+    for idx, sg in enumerate(subgoals):
+        print(f"  Subgoal {idx}: ({sg[0]:.2f}, {sg[1]:.2f})")
+        
+    return subgoals
+
 def simplify_path(path, min_step=0.2):
     if not path: return []
     simplified = [path[0]]
@@ -373,6 +424,7 @@ def visualize_path_on_map(map_path, path, goal, start, target_class, output_dir,
     cv2.imwrite(out_path, map_img)
     print(f"[INFO] 導航路徑已輸出至 {out_path}")
 
+# === 在做 rrt_star_planning 之前，先放這些工具函式 ===
 def compute_pixels_per_meter(bounds, w, h):
     SCALE_FACTOR = 10000 / 255.0
     xmin_pt, xmax_pt, zmin_pt, zmax_pt = bounds
@@ -413,6 +465,53 @@ def find_nearest_safe_pixel(edt, start_xy, min_clear_px, rmax=120):
                     return (float(x), float(y))
     return (float(x0), float(y0))
 
+def count_near_pixels(depth, near_m=0.27, min_blob_area=200):
+    """
+    健壯版近物像素計數（替換舊版）：
+      - 對 foot_depth 的 ROI 做中值濾波
+      - 只計入面積 >= min_blob_area 的近物連通元件
+    回傳:
+      near_cnt: ROI 內接近物體的像素總數（已去小雜點）
+      roi_area: ROI 總像素數
+    """
+    d = depth.astype(np.float32)
+    h, w = d.shape
+    # 下半部 + 中央窄窗（與你原本一致）
+    r0, r1 = int(h * 0.55), int(h * 0.95)
+    c0, c1 = int(w * 0.35), int(w * 0.65)
+
+    # 邊界保護
+    r0 = max(0, min(r0, h - 1)); r1 = max(0, min(r1, h))
+    c0 = max(0, min(c0, w - 1)); c1 = max(0, min(c1, w))
+    if r1 <= r0 or c1 <= c0:
+        return 0, 1  # 避免除以 0
+
+    roi = d[r0:r1, c0:c1].copy()
+    roi_area = roi.size if roi.size > 0 else 1
+
+    # 中值濾波（抑制鹽胡椒雜訊）
+    roi = cv2.medianBlur(roi, 3)
+
+    # 有效深度：去 NaN / Inf / 0
+    valid = np.isfinite(roi) & (roi > 0.01)
+    if not np.any(valid):
+        return 0, roi_area
+
+    # 近距二值圖
+    near_mask = np.zeros_like(roi, dtype=np.uint8)
+    near_mask[valid & (roi < float(near_m))] = 1
+
+    # 去除小連通元件（雜點）
+    num, labels, stats, _ = cv2.connectedComponentsWithStats(near_mask, connectivity=8)
+    clean = np.zeros_like(near_mask, dtype=np.uint8)
+    for i in range(1, num):  # 0 是背景
+        if stats[i, cv2.CC_STAT_AREA] >= int(min_blob_area):
+            clean[labels == i] = 1
+
+    near_cnt = int(clean.sum())
+    return near_cnt, roi_area
+
+
 def get_yaw_from_quat(q):
     # Habitat: yaw around Y，跟你先前用法一致
     return float(2.0 * math.atan2(q.imag[1], q.real))
@@ -423,8 +522,7 @@ def calibrate_turn_sign(env):
     yaw0 = get_yaw_from_quat(s0.rotation)
     env.sim.step("turn_left")
     yaw1 = get_yaw_from_quat(env.agent.get_state().rotation)
-    env.agent.set_state(s0, reset_sensors=True)
-    _ = env.sim.get_sensor_observations()
+    env.agent.set_state(s0)
     dyaw = wrap_to_pi(yaw1 - yaw0)
     return 1.0 if dyaw > 0 else -1.0  # 左轉若讓 yaw 變大 → +1；否則 -1
 
@@ -437,6 +535,9 @@ def pick_lookahead_index(path_world, start_idx, Ld_m=0.5):
         if d >= Ld_m:
             return i+1
     return len(path_world)-1
+
+
+from collections import deque
 
 def closest_projection_on_polyline(P, poly):
     """回傳 (s, e_ct, seg_i, t, Q)：
@@ -599,7 +700,7 @@ def run_navigation(env,
     MOVE_BATCH = 3
 
     # 進度卡住偵測
-    STUCK_WINDOW = 20       # 看最近 30 步
+    STUCK_WINDOW = 50       # 看最近 30 步
     STUCK_DELTA_S = 0.05    # 弧長進度 < 5 cm → 視為卡住
     REJOIN_AHEAD = 0.8      # 往前 rejoin 0.8 m
 
@@ -613,7 +714,7 @@ def run_navigation(env,
 
     # 依全域常數換算步數
     ESCAPE_BACK_STEPS = max(2, int(ESCAPE_BACKWARD_DIST / float(FORWARD_STEP)))
-    ESCAPE_FWD_PROBE_STEPS = max(4, int(0.5 / float(FORWARD_STEP)))  # 探走 ~0.35m
+    ESCAPE_FWD_PROBE_STEPS = max(4, int(0.35 / float(FORWARD_STEP)))  # 探走 ~0.35m
     ESCAPE_TURN_BATCH = 20  # 連續轉幾步再刷新一次畫面
 
     # 轉向鎖（避免剛轉完又反向抖動）
@@ -810,7 +911,7 @@ def run_navigation(env,
 if __name__ == "__main__":
     
     print("=== HW2 Part3 (V3 - 統一控制器版本) ===")
-    DPI = 300
+    DPI = 100
     currdir = os.path.dirname(os.path.abspath(__file__))
     MAP_PATH = os.path.join(currdir, f"map{DPI}.png")
     EXCEL_PATH = os.path.join(
@@ -868,23 +969,6 @@ if __name__ == "__main__":
     # 3) 以「縮小可行區」達成「障礙物膨脹」
     inflated_free = inflate_free_space(binary_map_with_goal, CLEAR_PX)
 
-    # # === 顯示膨脹前後差異 ===
-    # diff = cv2.absdiff(binary_map_with_goal, inflated_free)  #(膨脹掉的地方會變亮)
-    # combined = np.hstack([
-    #     cv2.cvtColor(binary_map_with_goal, cv2.COLOR_GRAY2BGR),
-    #     cv2.cvtColor(inflated_free, cv2.COLOR_GRAY2BGR),
-    #     cv2.cvtColor(diff, cv2.COLOR_GRAY2BGR)
-    # ])
-    # cv2.putText(combined, "Original", (30, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (0,255,0), 2)
-    # cv2.putText(combined, "Inflated", (w + 30, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (0,255,0), 2)
-    # cv2.putText(combined, "Difference", (2*w + 30, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (0,255,0), 2)
-    # cv2.imshow("Before vs After Inflation", combined)
-    # cv2.imwrite(os.path.join(OUTPUT_PATH, f"inflation_comparison_{target_class}.png"), combined)
-    # cv2.waitKey(0)
-    # cv2.destroyAllWindows()
-    # # === 顯示膨脹前後差異 ===
-    
-
     # 4) 若起點/終點被吃掉（太貼邊），投影回最近安全像素
     edt = compute_clearance_map(inflated_free)
 
@@ -901,7 +985,7 @@ if __name__ == "__main__":
         print(f"[SAFE] start/goal 調整→ start:{start}→{safe_start} | goal:{goal}→{safe_goal}")
 
     # 5) 用「膨脹後」地圖跑 RRT*
-    path, nodes, safe_start, safe_goal = rrt_star_planning(binary_map_with_goal, safe_start, safe_goal, SAFE_WEIGHT=500000)
+    path, nodes = rrt_star_planning(inflated_free, safe_start, safe_goal,MIN_SAFE_DIST=0, SAFE_WEIGHT=500000)
     # 顯示結果
     if path:
         print(f"[INFO] 路徑長度（像素）: {path_length_px(path):.1f} | 節點數: {len(nodes)}")
@@ -916,7 +1000,7 @@ if __name__ == "__main__":
     else:
         print("[INFO] 無路徑產生")
 
-    visualize_rrt(binary_map, nodes, safe_start, safe_goal, path)
+    visualize_rrt(binary_map, nodes, safe_start, goal, path)
 
     h, w, _ = cv2.imread(MAP_PATH).shape
     
@@ -953,21 +1037,13 @@ if __name__ == "__main__":
     # 先 snap，再用 snap 後位置算朝向
     start_world = np.array([start_x, 0.0, start_z], dtype=np.float32)
     snap = env.sim.pathfinder.snap_point(start_world)
-    print(world_path[:5])
-    print(snap)
-    print("====================================")
-    new_first = (snap[0],snap[2])
-    world_path = [new_first] + world_path[1:]
-    print(world_path[:5])
-    print("====================================")
 
-    dx = world_path[1][0] - world_path[0][0]
-    dz = world_path[1][1] - world_path[0][1]
+    dx = world_path[1][0] - snap[0]
+    dz = world_path[1][1] - snap[2]
     init_yaw = math.atan2(-dx, -dz)          # 弧度
 
-    env.reset_to([0,0,0], init_yaw)
+    env.reset_to([snap[0], 0.0, snap[2]], init_yaw)
 
-    
     s = env.agent.get_state()
     yaw = get_yaw_from_quat(s.rotation)
     fwd = np.array([-math.sin(yaw), 0.0, -math.cos(yaw)])

@@ -1,390 +1,240 @@
-import os
-import cv2
-import math
-import json
-import numpy as np
+import math, random, numpy as np
 import habitat_sim
-from habitat_sim.utils.common import d3_40_colors_rgb
-from PIL import Image
-import matplotlib.pyplot as plt
-
-# ==========================================================
-# Habitat 環境封裝
-# ==========================================================
-class HabitatEnvWrapper:
-    def __init__(self, sim_settings, floor=1):
-        self.cfg = self.make_simple_cfg(sim_settings)
-        self.sim = habitat_sim.Simulator(self.cfg)
-        self.agent = self.sim.initialize_agent(sim_settings["default_agent"])
-
-        # 初始化位置
-        state = habitat_sim.AgentState()
-        state.position = np.array([0.0, 0.0, 0.0]) if floor == 1 else np.array([0.0, 1.0, -1.0])
-        self.agent.set_state(state)
-        print("[DEBUG] action space keys:", list(self.cfg.agents[0].action_space.keys()))
-
-    def make_simple_cfg(self, settings):
-        sim_cfg = habitat_sim.SimulatorConfiguration()
-        sim_cfg.scene_id = settings["scene"]
-
-        agent_cfg = habitat_sim.agent.AgentConfiguration()
-        agent_cfg.action_space = {
-            "move_forward": habitat_sim.agent.ActionSpec(
-                "move_forward", habitat_sim.agent.ActuationSpec(amount=0.01)
-            ),
-            "turn_left": habitat_sim.agent.ActionSpec(
-                "turn_left", habitat_sim.agent.ActuationSpec(amount=2.0)
-            ),
-            "turn_right": habitat_sim.agent.ActionSpec(
-                "turn_right", habitat_sim.agent.ActuationSpec(amount=2.0)
-            ),
-        }
+from habitat_sim.nav import ShortestPath
 
 
-        def make_sensor(uuid, stype):
-            spec = habitat_sim.CameraSensorSpec()
-            spec.uuid = uuid
-            spec.sensor_type = stype
-            spec.resolution = [settings["height"], settings["width"]]
-            spec.position = [0.0, settings["sensor_height"], 0.0]
-            return spec
+# This function generates a config for the simulator.
+# It contains two parts:
+# one for the simulator backend
+# one for the agent, where you can attach a bunch of sensors
 
-        agent_cfg.sensor_specifications = [
-            make_sensor("color_sensor", habitat_sim.SensorType.COLOR),
-            make_sensor("depth_sensor", habitat_sim.SensorType.DEPTH),
-            make_sensor("semantic_sensor", habitat_sim.SensorType.SEMANTIC)
-        ]
-        return habitat_sim.Configuration(sim_cfg, [agent_cfg])
+def transform_rgb_bgr(image):
+    return image[:, :, [2, 1, 0]]
 
-    def step(self, action: str):
-        obs = self.sim.step(action)
-        return {
-            "rgb": obs["color_sensor"][:, :, [2, 1, 0]],
-            "depth": obs["depth_sensor"],
-            "semantic": self._decode_semantic(obs["semantic_sensor"]),
-        }
+def transform_depth(image):
+    depth_img = (image / 10 * 255).astype(np.uint8)
+    return depth_img
 
-    @staticmethod
-    def _decode_semantic(semantic_obs):
-        img = Image.new("P", (semantic_obs.shape[1], semantic_obs.shape[0]))
-        img.putpalette(d3_40_colors_rgb.flatten())
-        img.putdata((semantic_obs.flatten() % 40).astype(np.uint8))
-        return np.asarray(img.convert("RGB"))
+def transform_semantic(semantic_obs):
+    semantic_img = Image.new("P", (semantic_obs.shape[1], semantic_obs.shape[0]))
+    semantic_img.putpalette(d3_40_colors_rgb.flatten())
+    semantic_img.putdata((semantic_obs.flatten() % 40).astype(np.uint8))
+    semantic_img = semantic_img.convert("RGB")
+    semantic_img = cv2.cvtColor(np.asarray(semantic_img), cv2.COLOR_RGB2BGR)
+    return semantic_img
 
-# ==========================================================
-# 座標轉換
-# ==========================================================
-def load_bounds(json_path):
-    with open(json_path, "r") as f:
-        data = json.load(f)
-    return data["xmin"], data["xmax"], data["zmin"], data["zmax"]
+def make_simple_cfg(settings):
+    # simulator backend
+    sim_cfg = habitat_sim.SimulatorConfiguration()
+    sim_cfg.scene_id = settings["scene"]
+    sim_cfg.gpu_device_id = 0
 
-def pixel_to_world(u, v, w, h, bounds):
-    SCALE_FACTOR = 10000 / 255  # 固定比例
-    xmin, xmax, zmin, zmax = bounds
+    # agent
+    agent_cfg = habitat_sim.agent.AgentConfiguration()
+    
+    agent_cfg.action_space["move_backward"] = habitat_sim.agent.ActionSpec(
+        "move_forward", habitat_sim.agent.ActuationSpec(amount=-0.25)  # -0.25 表示向後走 0.25m
+    )
+    # In the 1st example, we attach only one sensor,
+    # a RGB visual sensor, to the agent
+    rgb_sensor_spec = habitat_sim.CameraSensorSpec()
+    rgb_sensor_spec.uuid = "color_sensor"
+    rgb_sensor_spec.sensor_type = habitat_sim.SensorType.COLOR
+    rgb_sensor_spec.resolution = [settings["height"], settings["width"]]
+    rgb_sensor_spec.position = [0.0, settings["sensor_height"], 0.0]
+    rgb_sensor_spec.orientation = [
+        settings["sensor_pitch"],
+        0.0,
+        0.0,
+    ]
+    rgb_sensor_spec.sensor_subtype = habitat_sim.SensorSubType.PINHOLE
 
-    # 步驟 1：將 pixel 正規化到 [0, 255]
-    u_norm = (u / w) * 255
-    v_norm = (v / h) * 255
+    #depth snesor
+    depth_sensor_spec = habitat_sim.CameraSensorSpec()
+    depth_sensor_spec.uuid = "depth_sensor"
+    depth_sensor_spec.sensor_type = habitat_sim.SensorType.DEPTH
+    depth_sensor_spec.resolution = [settings["height"], settings["width"]]
+    depth_sensor_spec.position = [0.0, settings["sensor_height"], 0.0]
+    depth_sensor_spec.orientation = [
+        settings["sensor_pitch"],
+        0.0,
+        0.0,
+    ]
+    depth_sensor_spec.sensor_subtype = habitat_sim.SensorSubType.PINHOLE
 
-    # 步驟 2：線性縮放到 Habitat 實際世界座標
-    x = u_norm * SCALE_FACTOR / 10000 * (xmax - xmin)
-    z = (255 - v_norm) * SCALE_FACTOR / 10000 * (zmax - zmin)
+    #semantic snesor
+    semantic_sensor_spec = habitat_sim.CameraSensorSpec()
+    semantic_sensor_spec.uuid = "semantic_sensor"
+    semantic_sensor_spec.sensor_type = habitat_sim.SensorType.SEMANTIC
+    semantic_sensor_spec.resolution = [settings["height"], settings["width"]]
+    semantic_sensor_spec.position = [0.0, settings["sensor_height"], 0.0]
+    semantic_sensor_spec.orientation = [
+        settings["sensor_pitch"],
+        0.0,
+        0.0,
+    ]
+    semantic_sensor_spec.sensor_subtype = habitat_sim.SensorSubType.PINHOLE
 
-    # 步驟 3：平移到正確範圍
-    x = xmin + x
-    z = zmin + z
+    agent_cfg.sensor_specifications = [rgb_sensor_spec, depth_sensor_spec, semantic_sensor_spec]
 
-    return float(x), float(z)
-
-
-# ==========================================================
-# 動作生成（安全版本）
-# ==========================================================
-FORWARD_STEP = 0.25
-TURN_ANGLE = 10.0
-ARRIVAL_THRESH = 0.15
-MAX_ACTIONS = 5000
-
-def wrap_to_pi(a): return (a + math.pi) % (2 * math.pi) - math.pi
-
-def generate_actions_from_world_path(world_path_xz,
-                                    forward_step_m=FORWARD_STEP,
-                                    turn_step_deg=TURN_ANGLE,
-                                    arrival_thresh_m=ARRIVAL_THRESH):
-    actions = []
-    sim_x, sim_z = world_path_xz[0]
-    yaw = 0.0
-
-    def turn_to(desired_yaw):
-        nonlocal yaw
-        step = math.radians(turn_step_deg)
-        d = wrap_to_pi(desired_yaw - yaw)
-        if abs(d) > math.radians(5):  # 放寬閾值
-            if d > 0:
-                actions.append("turn_left")
-                yaw += step
-            else:
-                actions.append("turn_right")
-                yaw -= step
-        # 不要無限迴圈，避免震盪
-        print(f"[turn] desired={math.degrees(desired_yaw):.1f}, curr={math.degrees(yaw):.1f}, diff={math.degrees(d):.1f}")
+    return habitat_sim.Configuration(sim_cfg, [agent_cfg])
 
 
-    def forward_to(tx, tz):
-        nonlocal sim_x, sim_z
-        dx, dz = tx - sim_x, tz - sim_z
-        dist = math.hypot(dx, dz)
-        print("dist:",dist)
-        if not np.isfinite(dist) or dist > 10:
-            print(f"⚠️ [WARN] Invalid dist={dist:.3f}, skipping")
-            return
-        n = max(1, int((dist - arrival_thresh_m) / forward_step_m))
-        n = min(n, 50)  # 安全上限
-        actions.extend(["move_forward"] * n)
-        sim_x, sim_z = tx, tz
-        print(f"[move] from ({sim_x:.2f},{sim_z:.2f}) → ({tx:.2f},{tz:.2f}), dist={dist:.2f}, yaw={math.degrees(desired_yaw):.1f}")
 
-    for k in range(1, len(world_path_xz)):
-        tx, tz = world_path_xz[k]
-        dx, dz = tx - sim_x, tz - sim_z
-        dist = math.hypot(dx, dz)
-        desired_yaw = math.atan2(dx, dz)  # 注意這裡反轉
+sim_settings = {
+    "scene": "replica_v1/apartment_0/habitat/mesh_semantic.ply",  # Scene path
+    "default_agent": 0,  # Index of the default agent
+    "sensor_height": 1.5,  # Height of sensors in meters, relative to the agent
+    "width": 512,  # Spatial resolution of the observations
+    "height": 512,
+    "sensor_pitch": 0,  # sensor pitch (x rotation in rads)
+}
 
-        print(f"Segment {k}: dist={dist:.4f}, yaw_diff={math.degrees(wrap_to_pi(desired_yaw - yaw)):.2f}")
+# ========= 你原本的 sim/cfg 建議保留 =========
+cfg = make_simple_cfg(sim_settings)
+sim = habitat_sim.Simulator(cfg)
 
+# === 1) 載入 navmesh（很重要：用對應場景的 .navmesh）===
+navmesh_path = "replica_v1/apartment_0/habitat/mesh_semantic.navmesh"
+sim.pathfinder.load_nav_mesh(navmesh_path)  # 成功後 sim.pathfinder.is_loaded() 會是 True
+pf = sim.pathfinder
 
-        turn_to(desired_yaw)
-        forward_to(tx, tz)
-        if len(actions) > MAX_ACTIONS:
-            print("⚠️ [WARN] Too many actions generated, truncating.")
-            break
+# === 2) 參數（單位：公尺）===
+STEP_SIZE_M      = 0.25          # RRT 每次延伸步長
+NEIGHBOR_COEFF   = 1.5           # RRT* 鄰域半徑係數（r ~ coeff * sqrt(log(n)/n)）
+CLEARANCE_M      = 0.20          # 你想要的最小安全距離（公尺）
+SEGMENT_CHECK_DS = 0.05          # 邊段離散檢查間距（越小越嚴）
+GOAL_TOL_M       = 0.20          # 抵達判定半徑（公尺）
+MAX_ITER         = 20000
 
-    print(f"[INFO] Total generated actions: {len(actions)}")
-    return actions
+# === 3) 工具函式 ===
+def same_island(a, b):
+    return pf.get_island(a) == pf.get_island(b)
 
-# ==========================================================
-# 導航與影片錄製
-# ==========================================================
-def overlay_mask(rgb, mask, color=(255, 0, 0), alpha=0.35):
-    out = rgb.copy()
-    color_layer = np.zeros_like(rgb)
-    color_layer[..., :] = color
-    blended = cv2.addWeighted(rgb, 1.0, color_layer, alpha, 0)
-    out[mask.astype(bool)] = blended[mask.astype(bool)]
-    return out
+def snap(p):
+    # 把點吸到 NavMesh（保持樓層/高度合規）
+    return pf.snap_point(p)
 
-def run_navigation(env, world_path, target_mask, output_video="result.mp4"):
-    actions = generate_actions_from_world_path(world_path)
+def point_ok(p):
+    # 點可走且保有安全距離
+    if not pf.is_navigable(p): return False
+    d = pf.distance_to_closest_obstacle(p, max_search_radius=CLEARANCE_M+0.5)
+    return d >= CLEARANCE_M
 
-    vw = cv2.VideoWriter(output_video, cv2.VideoWriter_fourcc(*"mp4v"), 120, (512, 512))
-    frame_count = 0
+def segment_ok(a, b):
+    # 沿著線段做稠密採樣，要求每個採樣點都可走且距離障礙 >= CLEARANCE_M
+    ab = np.array(b) - np.array(a)
+    L = np.linalg.norm(ab)
+    if L < 1e-6: return point_ok(a)
+    n = max(2, int(math.ceil(L / SEGMENT_CHECK_DS)))
+    for i in range(n+1):
+        t = i / n
+        p = a + t * ab
+        p = snap(p)  # 緊貼 NavMesh
+        if (not pf.is_navigable(p)) or (pf.distance_to_closest_obstacle(p, CLEARANCE_M+0.5) < CLEARANCE_M):
+            return False
+    return True
 
-    # for idx, act in enumerate(actions):
-    #     print(f"[Step {idx}] action={act}, pos={env.agent.get_state().position}")
-    #     # print(f"[Step {idx}] action={act}, pos={env.agent.get_state().position}, world path:{world_path[idx]}")
+def rand_sample_on_island(island_idx):
+    # 從全域取樣，直到落在同一個 island 且滿足安全距離
+    for _ in range(1000):
+        p = pf.get_random_navigable_point()
+        if pf.get_island(p) != island_idx: 
+            continue
+        if point_ok(p): 
+            return p
+    return None
 
-    #     obs = env.step(act)
-    #     # if idx % 10 != 0:
-    #     #     continue
-    #     rgb = obs["rgb"]
-    #     mask = target_mask(obs)
-    #     vis = overlay_mask(rgb, mask)
-    #     vw.write(cv2.cvtColor(vis, cv2.COLOR_RGB2BGR))
-    #     frame_count += 1
-    #     if idx % 200 == 0:
-    #         print(f"[INFO] Progress: {idx}/{len(actions)} actions executed")
-    for idx, act in enumerate(actions):
-        for sub in range(3):  # 每個動作輸出3幀
-            obs = env.step(act)
-            rgb = obs["rgb"]
-            mask = target_mask(obs)
-            vis = overlay_mask(rgb, mask)
-            vw.write(cv2.cvtColor(vis, cv2.COLOR_RGB2BGR))
-            frame_count += 1
+def steer(a, b, step=STEP_SIZE_M):
+    v = np.array(b) - np.array(a)
+    d = np.linalg.norm(v)
+    if d <= step: 
+        return snap(b)
+    return snap(a + v * (step / d))
 
+# === 4) RRT* 主流程（世界座標） ===
+class Node:
+    __slots__ = ("p","parent","cost")
+    def __init__(self, p, parent=None, cost=0.0):
+        self.p = np.array(p, dtype=np.float32)
+        self.parent = parent
+        self.cost = cost
 
-    vw.release()
-    print(f"[INFO] Navigation complete, {frame_count} frames saved ✅")
+def rrt_star_world(start_world, goal_world):
+    # 將起終點吸到 NavMesh，並確認在同一樓層/連通區
+    s0 = snap(np.array(start_world, dtype=np.float32))
+    g0 = snap(np.array(goal_world,  dtype=np.float32))
+    assert pf.is_navigable(s0) and pf.is_navigable(g0), "Start/Goal 不在可走區"
+    assert same_island(s0, g0), "Start/Goal 不在同一 island（可能不同樓層）"
+    assert point_ok(s0) and point_ok(g0), "Start/Goal 未滿足安全距離，請移動或放寬 CLEARANCE_M"
 
-def distance_to_path(current_pos, path):
-    """回傳 agent 到當前路徑上最近點的距離"""
-    if not path:
-        return np.inf
-    pxz = np.array([[px, pz] for px, pz in path])
-    pos_xz = np.array([current_pos[0], current_pos[2]])
-    dists = np.linalg.norm(pxz - pos_xz, axis=1)
-    return np.min(dists)
+    island_idx = pf.get_island(s0)
+    nodes = [Node(s0, parent=None, cost=0.0)]
+    goal_node = None
 
-def world_to_pixel(x, z, w, h, bounds):
-    """
-    將 Habitat 世界座標 (x, z) 反轉換回像素座標 (u, v)，
-    與 pixel_to_world() 完全對應。
-    """
-    SCALE_FACTOR = 10000 / 255
-    xmin, xmax, zmin, zmax = bounds
-
-    # Step 1: 還原到正規化空間 [0, 255]
-    x_ratio = (x - xmin) / (xmax - xmin)
-    z_ratio = (z - zmin) / (zmax - zmin)
-
-    u_norm = x_ratio * 10000 / SCALE_FACTOR
-    v_norm = 255 - (z_ratio * 10000 / SCALE_FACTOR)
-
-    # Step 2: 還原到像素座標空間 [0, w] × [0, h]
-    u = (u_norm / 255) * w
-    v = (v_norm / 255) * h
-
-    # Step 3: 四捨五入成整數像素位置
-    return int(round(u)), int(round(v))
-
-
-def run_navigation_replan(env, binary_map, color_map, bounds, start, goal, target_mask,
-                          output_video="result_replan.mp4", replan_thresh=0.3):
-    """
-    主導航流程：包含 stuck / deviation / goal 三種事件觸發
-    """
-    vw = cv2.VideoWriter(output_video, cv2.VideoWriter_fourcc(*"mp4v"), 60, (512, 512))
-    stuck_counter = 0
-    frame_count = 0
-
-    h, w = binary_map.shape
-    current_state = env.agent.get_state()
-    current_pos = current_state.position.copy()
-
-    # === 初始路徑規劃 ===
-    path_pixel, _ = rrt_planning(binary_map, start, goal)
-    world_path = [pixel_to_world(u, v, w, h, bounds) for (u, v) in path_pixel]
-    actions = generate_actions_from_world_path(world_path)
-    print(f"[INIT] RRT 路徑生成完成，共 {len(world_path)} 點")
-
-    while True:
-        for act in actions:
-            obs = env.step(act)
-            pos = env.agent.get_state().position.copy()
-            dist_to_goal = np.linalg.norm(pos[[0, 2]] - np.array(world_path[-1]))
-            dist_to_path = distance_to_path(pos, world_path)
-
-            # ======= 三種事件偵測 =======
-            if dist_to_goal < 0.2:
-                print(f"[SUCCESS] Reached goal ✅ ({pos[0]:.2f}, {pos[2]:.2f})")
-                vw.release()
-                return
-
-            if dist_to_path > replan_thresh:
-                print(f"[REPLAN] Deviated from path ({dist_to_path:.2f} m) → 重新規劃")
-                break  # 退出內層 loop，重新規劃
-
-            move_dist = np.linalg.norm(pos - current_pos)
-            if move_dist < 0.01:
-                stuck_counter += 1
-            else:
-                stuck_counter = 0
-
-            if stuck_counter > 20:
-                print("[REPLAN] Agent stuck → 重新規劃")
-                break  # 跳出重新規劃
-
-            # === 繪製畫面 ===
-            rgb = obs["rgb"]
-            mask = target_mask(obs)
-            vis = overlay_mask(rgb, mask)
-            vw.write(cv2.cvtColor(vis, cv2.COLOR_RGB2BGR))
-            frame_count += 1
-
-            current_pos = pos.copy()
+    for it in range(MAX_ITER):
+        # Goal bias
+        if random.random() < 0.25:
+            x_rand = g0
         else:
-            # 如果沒 break（未重規劃）則繼續
+            x_rand = rand_sample_on_island(island_idx)
+            if x_rand is None:
+                continue
+
+        # 最近鄰
+        dists = [np.linalg.norm(n.p - x_rand) for n in nodes]
+        idx   = int(np.argmin(dists))
+        x_near = nodes[idx].p
+
+        # 延伸
+        x_new = steer(x_near, x_rand, STEP_SIZE_M)
+        if not segment_ok(x_near, x_new):
             continue
 
-        # ======= 重新規劃 =======
-        print(current_pos[0], current_pos[2], bounds, w, h)
-        print("[DEBUG] bounds =", bounds)
+        # RRT* 鄰域重接
+        new_cost = nodes[idx].cost + np.linalg.norm(x_new - x_near)
+        node_new = Node(x_new, parent=nodes[idx], cost=new_cost)
 
-        start_pixel = world_to_pixel(current_pos[0], current_pos[2], w, h, bounds)
-        path_pixel, _ = rrt_planning(binary_map, start_pixel, goal)
-        while path_pixel is None:
-            print(f"❌ [REPLAN FAIL] 無法找到可行路徑， again。{start_pixel}")
-            path_pixel, _ = rrt_planning(binary_map, start_pixel, goal)
-            if path_pixel:
-                break
-        world_path = [pixel_to_world(u, v, w, h, bounds) for (u, v) in path_pixel]
-        actions = generate_actions_from_world_path(world_path)
-        print(f"[INFO] Replan done: {len(world_path)} points, {len(actions)} actions.")
+        # 鄰域半徑（經典 r ~ c * sqrt(log n / n)）
+        r = NEIGHBOR_COEFF * math.sqrt(math.log(len(nodes)+1) / (len(nodes)+1))
+        r = max(r, STEP_SIZE_M*2)
 
-    vw.release()
-    print(f"[END] Navigation finished, {frame_count} frames saved.")
+        # 找更好的 parent（保證每段邊「segment_ok」）
+        for j, nj in enumerate(nodes):
+            if np.linalg.norm(nj.p - x_new) <= r:
+                c_try = nj.cost + np.linalg.norm(nj.p - x_new)
+                if c_try + 1e-6 < node_new.cost and segment_ok(nj.p, x_new):
+                    node_new.parent = nj
+                    node_new.cost   = c_try
 
-# ==========================================================
-# 導航結果地圖輸出
-# ==========================================================
-def visualize_path_on_map(map_path, path, goal, start, target_class, output_dir, save_prefix="rrt_result_part3"):
-    map_img = cv2.imread(map_path)
-    if map_img is None:
-        print(f"❌ 找不到地圖檔: {map_path}")
-        return
+        nodes.append(node_new)
 
-    # 路徑線
-    for i in range(len(path) - 1):
-        p1, p2 = path[i], path[i + 1]
-        cv2.line(map_img, (int(p1[0]), int(p1[1])), (int(p2[0]), int(p2[1])), (0, 0, 255), 2)
+        # Rewire
+        for j, nj in enumerate(nodes[:-1]):
+            if np.linalg.norm(nj.p - x_new) <= r:
+                c_try = node_new.cost + np.linalg.norm(nj.p - x_new)
+                if c_try + 1e-6 < nj.cost and segment_ok(x_new, nj.p):
+                    nj.parent = node_new
+                    nj.cost   = c_try
 
-    # 起點與目標
-    cv2.circle(map_img, (int(start[0]), int(start[1])), 6, (0, 255, 0), -1)
-    cv2.circle(map_img, (int(goal[0]), int(goal[1])), 6, (255, 0, 0), -1)
+        # 抵達判定
+        if np.linalg.norm(node_new.p - g0) <= GOAL_TOL_M and segment_ok(node_new.p, g0):
+            goal_node = Node(g0, parent=node_new, cost=node_new.cost + np.linalg.norm(g0 - node_new.p))
+            break
 
-    # 標籤
-    cv2.putText(map_img, "Start", (int(start[0]) + 10, int(start[1]) - 10),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
-    cv2.putText(map_img, "Goal", (int(goal[0]) + 10, int(goal[1]) - 10),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 0, 0), 1)
+    # 回溯輸出路徑
+    if goal_node is None:
+        return None  # 規劃失敗，可調 MAX_ITER / CLEARANCE_M
+    path = []
+    cur = goal_node
+    while cur is not None:
+        path.append(cur.p.copy())
+        cur = cur.parent
+    path.reverse()
+    return path
 
-    out_path = f"{output_dir}/{save_prefix}_{target_class}.png"
-    cv2.imwrite(out_path, map_img)
-    print(f"[INFO] 導航路徑已輸出至 {out_path}")
-def simplify_path(path, min_step=0.2):
-    """移除相鄰太近的點，確保距離至少 min_step。"""
-    if not path:
-        return []
-    simplified = [path[0]]
-    for p in path[1:]:
-        if math.hypot(p[0] - simplified[-1][0], p[1] - simplified[-1][1]) >= min_step:
-            simplified.append(p)
-    return simplified
-
-# ==========================================================
-# 主程式
-# ==========================================================
-if __name__ == "__main__":
-    
-    print("=== HW2 Part3 (Safe Final Version) ===")
-
-    from part2 import rrt_planning, load_semantic_table, find_object_region
-
-    MAP_PATH = "/home/clu98753cs13/Desktop/course/phyai/physical-ai25/hw2/map.png"
-    EXCEL_PATH = "/home/clu98753cs13/Desktop/course/phyai/physical-ai25/hw2/color_coding_semantic_segmentation_classes.xlsx"
-    TARGET_CLASS = "window"
-    BOUNDS_PATH = "/home/clu98753cs13/Desktop/course/phyai/physical-ai25/hw2/coordinate_bounds.json"
-    OUTPUT_PATH = "./part3OUTPUT"
-    os.makedirs(OUTPUT_PATH, exist_ok=True)
-
-    # === Part2 輸出接續 ===
-    color_map = load_semantic_table(EXCEL_PATH)
-    goal, mask = find_object_region(MAP_PATH, color_map, TARGET_CLASS)
-    start = (335, 240)
-
-    map_gray = cv2.imread(MAP_PATH, cv2.IMREAD_GRAYSCALE)
-    _, binary = cv2.threshold(map_gray, 240, 255, cv2.THRESH_BINARY)
-    path, _ = rrt_planning(binary, start, goal)
-    if path is None:
-        print("❌ 無法找到可行路徑。")
-        exit()
-
-    # pixel → world
-    bounds = load_bounds(BOUNDS_PATH)
-    h, w, _ = cv2.imread(MAP_PATH).shape
-    print(w,h)
-    x, z = pixel_to_world(335, 240, w, h, bounds)
-    u, v = world_to_pixel(0.95390034/40, 5.5232677/40 , w, h, bounds)
-    print(f"Round-trip result:{x},{z} ({u}, {v}) ≈ (335, 240)")
-
+# === 5) 使用範例 ===
+start = np.array([0.0, 0.0, 0.0])  # 你的世界座標（會 snap 到地面）
+goal  = np.array([2.0, 0.0, 5.0])
+path_world = rrt_star_world(start, goal)
+print(f"path has {len(path_world) if path_world else 0} waypoints")

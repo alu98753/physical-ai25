@@ -6,8 +6,6 @@ import random
 import math
 from collections import deque
 import os
-# import scipy
-# from scipy.spatial import KDTree
 from rtree import index
 # ==========================================================
 # 路徑設定
@@ -32,9 +30,6 @@ COLLISION_SAMPLES_PER_STEP = 4  # 線段碰撞取樣密度（距離/STEP_SIZE*�
 
 # (參數) 靠近目標多近時 (px)，停止計算安全懲罰
 GOAL_SAFETY_EXEMPT_DIST = 250.0
-# ==========================================================
-# 結構
-# ==========================================================
 
 class Node:
     __slots__ = ("x", "y", "parent", "cost")
@@ -128,7 +123,7 @@ def nearest(nodes, point):
     best, best_d = None, float("inf")
     px, py = point
     for n in nodes:
-        d = (n.x - px)**2 + (n.y - py)**2  # 用平方距離省 sqrt
+        d = (n.x - px)**2 + (n.y - py)**2 
         if d < best_d:
             best_d = d
             best = n
@@ -170,24 +165,24 @@ def sample_informed(start, goal, c_best, rng, map_shape, labels, start_label):
     if not np.isfinite(c_best) or c_best <= c_min + 1e-6:
         return None
 
-    # 橢圓參數 ( ... 保持不變 ... )
+    # 橢圓參數 
     a = c_best / 2.0
     b = math.sqrt(max(a*a - (c_min/2.0)**2, 1e-6))
     theta = math.atan2(goal[1]-start[1], goal[0]-start[0])
 
-    # 在單位圓內取樣 ( ... 保持不變 ... )
+    # 在單位圓內取樣 
     r = math.sqrt(rng.random())
     ang = 2*math.pi*rng.random()
     x_e = r * math.cos(ang) * a
     y_e = r * math.sin(ang) * b
 
-    # 旋轉 & 平移 ( ... 保持不變 ... )
+    # 旋轉 & 平移 
     c = math.cos(theta)
     s = math.sin(theta)
     x = x_e * c - y_e * s + (start[0] + goal[0]) / 2.0
     y = x_e * s + y_e * c + (start[1] + goal[1]) / 2.0
 
-    # ✅ 【修改】: 檢查點的有效性
+    # 檢查點的有效性
     x_i, y_i = int(round(x)), int(round(y))
     H, W = map_shape
 
@@ -366,7 +361,7 @@ def find_all_object_instances(map_path, color_map, target_class):
     """
     img = cv2.imread(map_path)
     if img is None:
-        raise FileNotFoundError(f"❌ 找不到地圖: {map_path}")
+        raise FileNotFoundError(f" 找不到地圖: {map_path}")
     
     target_class = target_class.lower()
     if target_class not in color_map:
@@ -480,7 +475,7 @@ def load_semantic_table(excel_path):
         elif c.strip().lower() in ["name", "class", "object", "color", "color name"]:
             name_col = c
     if color_col is None or name_col is None:
-        raise ValueError(f"❌ 無法在 Excel 中找到顏色或名稱欄位，檢查欄名：{list(df.columns)}")
+        raise ValueError(f" 無法在 Excel 中找到顏色或名稱欄位，檢查欄名：{list(df.columns)}")
     color_map = {}
     for _, row in df.iterrows():
         id = row[0]
@@ -506,7 +501,7 @@ def load_semantic_ID_table(excel_path):
             name_col = c
 
     if name_col is None:
-        raise ValueError(f"❌ 無法在 Excel 中找到名稱欄位，檢查欄名：{list(df.columns)}")
+        raise ValueError(f" 無法在 Excel 中找到名稱欄位，檢查欄名：{list(df.columns)}")
 
     id_map = {}
     for _, row in df.iterrows():
@@ -522,7 +517,7 @@ def load_semantic_ID_table(excel_path):
 def find_object_region(map_path, color_map, target_class):
     img = cv2.imread(map_path)
     if img is None:
-        raise FileNotFoundError(f"❌ 找不到地圖: {map_path}")
+        raise FileNotFoundError(f" 找不到地圖: {map_path}")
     target_class = target_class.lower()
     if target_class not in color_map:
         raise ValueError(f"⚠️ 類別 '{target_class}' 不在語意表中。")
@@ -615,7 +610,7 @@ def visualize_multiple_goals(map_path, goals_list, target_class):
 
         # 在圖上標出選擇結果
         ax.scatter(nearest_goal[0], nearest_goal[1], c='yellow', s=150, zorder=6, marker='o', label='Selected')
-        ax.text(nearest_goal[0]+10, nearest_goal[1]+10, "✅ SELECTED", color='yellow', fontsize=10,
+        ax.text(nearest_goal[0]+10, nearest_goal[1]+10, " SELECTED", color='yellow', fontsize=10,
                 bbox=dict(facecolor='black', alpha=0.6, pad=0.1))
         fig.canvas.draw()
 
@@ -628,13 +623,13 @@ def visualize_multiple_goals(map_path, goals_list, target_class):
     fig.canvas.mpl_disconnect(cid)
 
     if selected_goal[0] is None:
-        raise ValueError("❌ 沒有選擇任何目標（未點擊）")
+        raise ValueError(" 沒有選擇任何目標（未點擊）")
 
     return selected_goal[0]
 
 def find_nearest_safe_point_in_region_radial(map_img, labels_map, target_label, p, max_radius=100, safe_radius=5):
     """
-    (✅ 新函數：專門用於修正 Goal)
+    ( 新函數：專門用於修正 Goal)
     從點 p (通常是原始 goal) 開始，徑向 (方型) 搜索
     第一個「同時」滿足以下條件的點：
     1. 位於 labels_map 上的 target_label 區域
@@ -686,7 +681,7 @@ def find_nearest_safe_point_in_region_radial(map_img, labels_map, target_label, 
 from collections import deque # 確保在檔案開頭 import deque
 def build_bfs_distance_map_downsampled(map_crop, start_local, downsample_factor):
     """
-    (✅ BBox + Downsample 優化版)
+    ( BBox + Downsample 優化版)
     1. 接收一個 *已經裁剪* 的地圖 (map_crop)
     2. 接收一個 *相對於* 裁剪地圖的起點 (start_local)
     3. 接收一個降採樣因子 (downsample_factor)
@@ -697,7 +692,7 @@ def build_bfs_distance_map_downsampled(map_crop, start_local, downsample_factor)
     # 1. 獲取裁剪後地圖的尺寸
     H_crop, W_crop = map_crop.shape
     if H_crop == 0 or W_crop == 0:
-        print("❌ BFS 錯誤：BBox 裁剪後地圖為空。")
+        print(" BFS 錯誤：BBox 裁剪後地圖為空。")
         return np.full((H_crop, W_crop), np.inf, dtype=np.float32)
 
     # 2. 降採樣地圖
@@ -717,7 +712,7 @@ def build_bfs_distance_map_downsampled(map_crop, start_local, downsample_factor)
     # 檢查起點是否有效
     if not (0 <= sx_small < W_small and 0 <= sy_small < H_small and \
             map_small[sy_small, sx_small] >= 128):
-        print(f"❌ BFS 錯誤：降採樣後的起點 ({sx_small}, {sy_small}) 不在可行走區域。")
+        print(f" BFS 錯誤：降採樣後的起點 ({sx_small}, {sy_small}) 不在可行走區域。")
         # 即使起點無效，仍返回放大的 inf 地圖，讓後續邏輯失敗
     else:
         q = deque([(sx_small, sy_small)])
@@ -765,7 +760,7 @@ def find_nearest_safe_point_INSIDE(map_img, start_dist_map, start_point, origina
                                 max_radius=100, safe_radius=5, 
                                 path_ratio_threshold=5.0):
     """
-    (✅ 新函數：專門用於修正 Goal)
+    ( 新函數：專門用於修正 Goal)
     從 original_goal 開始徑向搜索，找到一個「內部」的安全點。
     「內部」定義為：
     1. 該點 P 可從 start 到達 (start_dist_map[P] < inf)
@@ -837,7 +832,7 @@ def find_nearest_safe_point_INSIDE(map_img, start_dist_map, start_point, origina
 def rrt_star_planning(map_img, start, goal,MIN_SAFE_DIST, SAFE_WEIGHT=10000.0):
     """
     改良版 RRT*：使用統一的倒數平方懲罰推離牆面。
-    ✅ 使用 R-Tree 取代 KD-Tree 以實現 $O(\log N)$ 增量更新
+     使用 R-Tree 取代 KD-Tree 以實現 $O(\log N)$ 增量更新
     """
     H, W = map_img.shape[:2]
     # 加一道「安全膨脹」：侵蝕可行區（用來避免鑽窄縫和牆體瑕疵）
@@ -861,7 +856,7 @@ def rrt_star_planning(map_img, start, goal,MIN_SAFE_DIST, SAFE_WEIGHT=10000.0):
     original_start, original_goal = start, goal
     is_start_modified = is_goal_modified = False
 
-    # ✅ 步驟 1: 修正 Start 點 (使用舊的 'find_nearest_safe_point_radial')
+    #  步驟 1: 修正 Start 點 (使用舊的 'find_nearest_safe_point_radial')
     # (我們只想找 *任何* 安全點作為 BFS 起點)
     if not (0 <= int(start[1]) < H and 0 <= int(start[0]) < W) or \
        map_img[int(start[1]), int(start[0])] < 128 or \
@@ -877,11 +872,11 @@ def rrt_star_planning(map_img, start, goal,MIN_SAFE_DIST, SAFE_WEIGHT=10000.0):
 
     # 檢查修正後的 start
     if not (0 <= int(start[1]) < H and 0 <= int(start[0]) < W and map_img[int(start[1]), int(start[0])] >= 128):
-        print(f"❌ 錯誤：修正後的起點 {start} 仍位於障礙物標籤。")
+        print(f" 錯誤：修正後的起點 {start} 仍位於障礙物標籤。")
         return None, []
     
     print(f"[INFO] 已確定 Start 位於安全區域: {start}")
-# ✅ 步驟 2: 計算 Bounding Box
+#  步驟 2: 計算 Bounding Box
     buffer = 100 # 您提議的緩衝區 (像素)
     DOWNSAMPLE_FACTOR = 4 # 降採樣 4 倍 (總像素減少 16 倍)
     x_min = max(0, int(min(start[0], original_goal[0]) - buffer))
@@ -900,19 +895,19 @@ def rrt_star_planning(map_img, start, goal,MIN_SAFE_DIST, SAFE_WEIGHT=10000.0):
     print(f"[INFO] BBox 範圍: {(x_min, y_min, x_max, y_max)}")
     print(f"[INFO] 裁剪尺寸: {map_crop.shape}, 降採樣因子: {DOWNSAMPLE_FACTOR}")
 
-    # ✅ 步驟 3: 建立 BFS 路徑距離圖 (使用新函數)
+    #  步驟 3: 建立 BFS 路徑距離圖 (使用新函數)
     dist_map_crop = build_bfs_distance_map_downsampled(
         map_crop, 
         start_local, 
         DOWNSAMPLE_FACTOR
     )
 
-    # ✅ 步驟 4: 將結果貼回 (Paste) 到全尺寸地圖
+    #  步驟 4: 將結果貼回 (Paste) 到全尺寸地圖
     start_dist_map = np.full(map_img.shape, np.inf, dtype=np.float32)
     start_dist_map[y_min:y_max, x_min:x_max] = dist_map_crop
 
 
-    # ✅ 步驟 3: 修正 Goal 點
+    #  步驟 3: 修正 Goal 點
     # 檢查：Goal 是否已在 "內部" 且安全？
     gx_i, gy_i = int(goal[0]), int(goal[1])
     is_safe = False
@@ -939,7 +934,7 @@ def rrt_star_planning(map_img, start, goal,MIN_SAFE_DIST, SAFE_WEIGHT=10000.0):
         print(f"    ... 正在搜尋 {original_goal} 附近，最接近的「內部」安全點...")
         
         goal_old = goal
-        # ✅✅✅ 使用我們新開發的、基於 BFS 的函數！ ✅✅✅
+        #  使用我們新開發的、基於 BFS 的函數！ 
         goal = find_nearest_safe_point_INSIDE(
             map_img, 
             start_dist_map, 
@@ -952,7 +947,7 @@ def rrt_star_planning(map_img, start, goal,MIN_SAFE_DIST, SAFE_WEIGHT=10000.0):
         
         if goal is None:
             # 如果新函數返回 None，代表在 180px 內找不到替代點
-            print(f"❌ 錯誤：在原始目標 {goal_old} 附近 180px 內，找不到「內部」安全替代點。")
+            print(f" 錯誤：在原始目標 {goal_old} 附近 180px 內，找不到「內部」安全替代點。")
             return None, []
             
         print(f"Goal: {goal_old} → {goal}")
@@ -1059,14 +1054,14 @@ def rrt_star_planning(map_img, start, goal,MIN_SAFE_DIST, SAFE_WEIGHT=10000.0):
     # 1. start/goal 是否落在障礙物上 (label=0) (雖然前面修正過，但 double check)
     # 2. start/goal 是否在不同的連通區域 (無法到達)
     if start_label == 0:
-        print(f"❌ 錯誤：修正後的起點 {start} 位於障礙物標籤 (label=0)。")
+        print(f" 錯誤：修正後的起點 {start} 位於障礙物標籤 (label=0)。")
         return None, []
     if goal_label == 0:
-        print(f"❌ 錯誤：修正後的目標 {goal} 位於障礙物標籤 (label=0)。")
+        print(f" 錯誤：修正後的目標 {goal} 位於障礙物標籤 (label=0)。")
         return None, []
     if start_label != goal_label:
         print(
-            f"❌ 錯誤：起點 (區域 {start_label}) 和目標 (區域 {goal_label}) 位於不同的連通區域，路徑不存在。")
+            f" 錯誤：起點 (區域 {start_label}) 和目標 (區域 {goal_label}) 位於不同的連通區域，路徑不存在。")
         return None, []
 
     print(f"[INFO] Start/Goal 均位於連通區域 {start_label}。")
@@ -1078,7 +1073,7 @@ def rrt_star_planning(map_img, start, goal,MIN_SAFE_DIST, SAFE_WEIGHT=10000.0):
     free_coords_cv = cv2.findNonZero(sampling_mask)
 
     if free_coords_cv is None:
-        print(f"❌ 錯誤：在區域 {start_label} 中找不到任何可行走點。")
+        print(f" 錯誤：在區域 {start_label} 中找不到任何可行走點。")
         return None, []
 
     # 將 (N, 1, 2) 轉換為 (N, 2) 以便快速索引
@@ -1091,7 +1086,7 @@ def rrt_star_planning(map_img, start, goal,MIN_SAFE_DIST, SAFE_WEIGHT=10000.0):
     best_goal_node = None
     c_best = float("inf")
 
-    # ✅ 【優化】: 初始化 R-Tree
+    #  【優化】: 初始化 R-Tree
     # R-Tree 儲存 (id, (x, y, x, y), object)
     # 這裡的 id 我們直接用 node 在 'nodes' list 中的索引 (index)
     p = index.Property()
@@ -1127,7 +1122,7 @@ def rrt_star_planning(map_img, start, goal,MIN_SAFE_DIST, SAFE_WEIGHT=10000.0):
 
         # --- (延伸/安全採樣檢查 ... ) ---
 
-        # ✅ 【修改】: 使用 R-Tree 查詢最近鄰 (Nearest)
+        #  【修改】: 使用 R-Tree 查詢最近鄰 (Nearest)
         # R-Tree 查詢點 (x, y) 必須提供 bounding box (x, y, x, y)
         # 查詢返回的是 generator，用 next() 取第一個 (k=1)
         # R-Tree.nearest 返回的是 id (即 'nodes' list 的索引)
@@ -1188,7 +1183,7 @@ def rrt_star_planning(map_img, start, goal,MIN_SAFE_DIST, SAFE_WEIGHT=10000.0):
         n = len(nodes)
         radius = NEIGHBOR_COEFF * math.sqrt(max(math.log(n) / n, 1e-9))
 
-        # ✅ 【修改】: 使用 R-Tree 查詢鄰居 (Near / Ball Query)
+        #  【修改】: 使用 R-Tree 查詢鄰居 (Near / Ball Query)
         # R-Tree 範圍查詢 (intersection) 需要 Bounding Box
         bounds = (
             new_node.x - radius, new_node.y - radius,
@@ -1217,7 +1212,7 @@ def rrt_star_planning(map_img, start, goal,MIN_SAFE_DIST, SAFE_WEIGHT=10000.0):
         new_node.parent = best_parent
         new_node.cost = best_cost
 
-        # ✅ 【修改】: 增量更新 R-Tree
+        #  【修改】: 增量更新 R-Tree
         # 1. 先將新節點加入 'nodes' list
         nodes.append(new_node)
         # 2. 獲取新節點的索引 (id)
@@ -1226,7 +1221,7 @@ def rrt_star_planning(map_img, start, goal,MIN_SAFE_DIST, SAFE_WEIGHT=10000.0):
         rtree.insert(new_node_id, (new_node.x,
                     new_node.y, new_node.x, new_node.y))
 
-        # ❌ 【移除】: 刪除 vstack 和 KDTree 重建
+        #  【移除】: 刪除 vstack 和 KDTree 重建
         # node_coords = np.vstack([node_coords, new_node.pt])
         # kdtree = KDTree(node_coords)
 
@@ -1258,7 +1253,7 @@ def rrt_star_planning(map_img, start, goal,MIN_SAFE_DIST, SAFE_WEIGHT=10000.0):
 
     # === 收尾 ===
     if best_goal_node is None:
-        print("❌ 未找到可行路徑。")
+        print(" 未找到可行路徑。")
         return None, nodes
 
     raw_path = extract_path(best_goal_node)
@@ -1287,7 +1282,7 @@ if __name__ == "__main__":
     id_map = load_semantic_ID_table(EXCEL_PATH)
     map_img = cv2.imread(MAP_PATH)
     if map_img is None:
-        raise FileNotFoundError(f"❌ 找不到地圖: {MAP_PATH}")
+        raise FileNotFoundError(f" 找不到地圖: {MAP_PATH}")
 
     # Step 2. 掃描地圖中實際出現的顏色
     unique_colors = np.unique(map_img.reshape(-1, 3), axis=0)
@@ -1298,7 +1293,7 @@ if __name__ == "__main__":
         if bgr in unique_colors_set:
             available_classes.append(name)
     if not available_classes:
-        raise RuntimeError("❌ map.png 找不到任何語意類別，請確認顏色與語意表一致。")
+        raise RuntimeError(" map.png 找不到任何語意類別，請確認顏色與語意表一致。")
     print(f"[INFO] 可用的目標類別（出現在地圖上）：{available_classes}")
 
     # Step 3. 讓使用者輸入目標並選起點

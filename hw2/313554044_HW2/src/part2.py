@@ -91,7 +91,7 @@ def load_semantic_table(excel_path):
             name_col = c
 
     if color_col is None or name_col is None:
-        raise ValueError(f"❌ 無法在 Excel 中找到顏色或名稱欄位，檢查欄名：{list(df.columns)}")
+        raise ValueError(f" 無法在 Excel 中找到顏色或名稱欄位，檢查欄名：{list(df.columns)}")
 
     color_map = {}
 
@@ -112,7 +112,7 @@ def load_semantic_table(excel_path):
 def find_object_region(map_path, color_map, target_class):
     img = cv2.imread(map_path)
     if img is None:
-        raise FileNotFoundError(f"❌ 找不到地圖: {map_path}")
+        raise FileNotFoundError(f" 找不到地圖: {map_path}")
 
     target_class = target_class.lower()
     if target_class not in color_map:
@@ -177,7 +177,7 @@ def rrt_planning(map_img, start, goal):
             path = extract_path(final_node)
             return path, nodes
 
-    print("❌ 未找到可行路徑。")
+    print(" 未找到可行路徑。")
     return None, nodes
 
 # ==========================================================
@@ -218,7 +218,7 @@ if __name__ == "__main__":
     color_map = load_semantic_table(EXCEL_PATH)
     map_img = cv2.imread(MAP_PATH)
     if map_img is None:
-        raise FileNotFoundError(f"❌ 找不到地圖: {MAP_PATH}")
+        raise FileNotFoundError(f" 找不到地圖: {MAP_PATH}")
 
     # ==========================================================
     # Step 2. 掃描地圖中實際出現的顏色
@@ -235,7 +235,7 @@ if __name__ == "__main__":
             available_classes.append(name)
 
     if not available_classes:
-        raise RuntimeError("❌ 無法在 map.png 找到任何語意類別，請確認顏色與語意表一致。")
+        raise RuntimeError(" 無法在 map.png 找到任何語意類別，請確認顏色與語意表一致。")
 
     print(f"[INFO] 此地圖中實際可用的目標類別共有 {len(available_classes)} 種：")
     print(available_classes)

@@ -194,7 +194,7 @@ def distance_to_path(current_pos, path):
     return np.min(dists)
 
 def pixel_to_world(u, v, w, h, bounds):
-    SCALE_FACTOR = 10000 / 255
+    SCALE_FACTOR = 10000 / 255 
     xmin_pt, xmax_pt, zmin_pt, zmax_pt = bounds
     x_pt = xmin_pt + (u / w) * (xmax_pt - xmin_pt)
     z_pt = zmin_pt + (1.0 - (v / h)) * (zmax_pt - zmin_pt)
@@ -428,464 +428,125 @@ def count_near_pixels(depth, near_m=0.25):
     return int(np.sum(roi[valid] < near_m)), roi.size
 
 
-# #########################################
-# #########################################
-# [!!! V12 修復版 - 替換 L364-L547 !!!]
-def _execute_smart_escape(env, escape_turn_angle, escape_backward_dist, proactive_avoidance_threshold,
-                        target_mask, frame_count, FPS, FORWARD_STEP, TURN_ANGLE, commit_distance_m=0.5):
+def get_yaw_from_quat(q):
+    # Habitat: yaw around Y，跟你先前用法一致
+    return float(2.0 * math.atan2(q.imag[1], q.real))
+
+def calibrate_turn_sign(env):
+    """檢查 'turn_left' 會讓 yaw 增加或減少；回傳 +1 或 -1。"""
+    s0 = env.agent.get_state()
+    yaw0 = get_yaw_from_quat(s0.rotation)
+    env.sim.step("turn_left")
+    yaw1 = get_yaw_from_quat(env.agent.get_state().rotation)
+    env.agent.set_state(s0)
+    dyaw = wrap_to_pi(yaw1 - yaw0)
+    return 1.0 if dyaw > 0 else -1.0  # 左轉若讓 yaw 變大 → +1；否則 -1
+
+
+# =========================
+# 極簡循跡控制器（無避障）
+# =========================
+def get_current_yaw_rad(env):
+    q = env.agent.get_state().rotation  # [x,y,z,w] 對應 imag={x,y,z}, real=w
+    return 2.0 * math.atan2(q.imag[1], q.real)  # Habitat y 軸為上，採用 yaw around +y
+
+def yaw_to_target_rad(curr_pos, target_x, target_z):
+    # Habitat 座標 -> 你先前用法：desired = atan2(-dx, -dz)
+    dx = target_x - curr_pos[0]
+    dz = target_z - curr_pos[2]
+    return math.atan2(-dx, -dz)
+
+def find_lookahead_point(world_path, pos_xz, search_start_idx, L):
     """
-    執行智能脫困 FSM (V12 - 優化修復版)
-    
-    修復了 V11 中的「無限旋轉」和「掃描失敗」Bug。
-    
-    FSM 順序 (已優化):
-    1. Backward (Setup) - 先退到安全區域
-    2. Peek (Setup)     - 在安全區域觀察
-    3. [Loop] -> Scan_Turn -> Commit - 尋找並執行
+    從 search_start_idx 之後往前掃，找第一個與當前位置距離 >= L 的點。
+    若沒找到，就回傳最終目標。
+    回傳：(tx, tz, new_start_idx)
     """
-    
-    print(f"[FSM] Smart escape maneuver triggered. FSM (V12): Backward -> Peek -> [Scan->Commit Loop]")
-    
-    # === Phase 1: Backward (Reactive V2) ===
-    # (V12: 已移至 FSM 第一步)
-    print(f"[FSM-BACKWARD] Executing: Adaptive Backward (max {escape_backward_dist}m)")
-
-    # (V12: 刪除所有 "Memory BEFORE backward" 邏輯，它是 Bug 的來源)
-
-    # 強制至少後退 0.2m (或 escape_backward_dist 的一半)
-    min_dist_to_clear = min(0.2, escape_backward_dist * 0.5)
-    min_backward_steps = max(1, int(min_dist_to_clear / FORWARD_STEP))
-    steps_taken = 0
-    obs = None
-    cleared = False
-
-    while steps_taken < min_backward_steps:
-        obs = navigateAndSee(env, "move_backward", target_mask)
-        steps_taken += 1
-        
-        current_depth = obs["depth"]
-        near_pixels_front = np.sum(current_depth < 0.1)
-        
-        if near_pixels_front < proactive_avoidance_threshold:
-            cleared = True
-        
-        if cleared and steps_taken >= min_backward_steps:
-            print(f"[FSM-BACKWARD] Backward clear after {steps_taken * FORWARD_STEP:.2f}m.")
+    px, pz = pos_xz
+    n = len(world_path)
+    best_j = None
+    for j in range(search_start_idx, n):
+        d = math.hypot(world_path[j][0] - px, world_path[j][1] - pz)
+        if d >= L:
+            best_j = j
             break
-    else:
-        print(f"[FSM-BACKWARD] Backward max distance reached.")
-        
-    if obs is None:
-        obs = env.sim.get_sensor_observations()
+    if best_j is None:
+        best_j = n - 1
+    # 為了避免回頭，讓起始索引單調不減
+    new_start = max(search_start_idx, min(best_j, n - 1))
+    return world_path[best_j][0], world_path[best_j][1], new_start
 
-    # === Phase 2: Peek (Setup) ===
-    # (V12: 在後退 *之後* 執行)
-
-    # --- 1. Get current state & Peek ---
-    original_state = env.agent.get_state()
-    original_pos = original_state.position
-    original_rot = original_state.rotation
-    
-    turn_angle_rad = math.radians(escape_turn_angle)
-    y_axis = np.array([0, 1, 0])
-    q_left = habitat_sim.utils.common.quat_from_angle_axis(turn_angle_rad, y_axis)
-    q_right = habitat_sim.utils.common.quat_from_angle_axis(-turn_angle_rad, y_axis)
-
-    # Peek Left
-    left_rot = original_rot * q_left
-    left_state = habitat_sim.AgentState(original_pos, left_rot)
-    env.agent.set_state(left_state)
-    obs_left = env.sim.get_sensor_observations()
-    near_pixels_left = np.sum(obs_left["depth"] < 0.2)
-    print(f"[FSM-PEEK] Peek Left ({escape_turn_angle} deg): {near_pixels_left} near pixels.")
-
-    # Peek Right
-    right_rot = original_rot * q_right
-    right_state = habitat_sim.AgentState(original_pos, right_rot)
-    env.agent.set_state(right_state)
-    obs_right = env.sim.get_sensor_observations()
-    near_pixels_right = np.sum(obs_right["depth"] < 0.2)
-    print(f"[FSM-PEEK] Peek Right (-{escape_turn_angle} deg): {near_pixels_right} near pixels.")
-
-    # Return to Original State
-    env.agent.set_state(original_state)
-    print("[FSM-PEEK] Returned to original orientation for decision.")
-
-    if near_pixels_left <= near_pixels_right:
-        escape_action = "turn_left"
-        print(f"[FSM-PEEK] Decision: Scan Left first.")
-    else:
-        escape_action = "turn_right"
-        print(f"[FSM-PEEK] Decision: Scan Right first.")
-
-
-    # === Phase 3: Find & Commit Loop (循環重試) ===
-
-    # [!!! 關鍵修復 V12 !!!]
-    # 我們定義一個新的、*高於* 0.2m 避障門檻的「掃描安全門檻」
-    # 
-    # 主迴圈觸發門檻 (L653): 0.2m
-    # 掃描安全門檻 (Main):  0.25m (必須 > 0.2m 才能避免無限循環)
-    # 掃描安全門檻 (Floor): 0.2m (維持不變)
-    SCAN_CLEAR_THRESHOLD_MAIN = 0.25
-    SCAN_CLEAR_THRESHOLD_FLOOR = 0.2
-
-    scan_attempts = 0
-
-    while scan_attempts < 2:  # 最多嘗試 2 次 (例如，左 180 度 + 右 180 度)
-
-        # --- 3. Scan_Turn (Dynamic V2) ---
-        print(f"[FSM-SCAN] Attempt {scan_attempts+1}/2: Scanning {escape_action} until clear for {SCAN_CLEAR_THRESHOLD_MAIN} m...")
-        
-        max_turn_steps = int(180 // TURN_ANGLE)  # 每次掃描 180 度
-        found_clear_path = False
-
-        # 關鍵修正：先轉一步，再開始檢查
-        obs = navigateAndSee(env, escape_action, target_mask) ; frame_count += 1
-        for i in range(1, max_turn_steps):
-            # --- 1. 檢查主攝影機 (1.5m 高度) ---
-            current_depth = obs["depth"]
-            h, w = current_depth.shape
-            # 恢復使用合理的中央寬度
-            center_view = current_depth[:, int(w * 0.3):int(w * 0.7)]
-            
-            # 策略檢查：前方是否有足夠 "承諾" 的距離
-            min_clear_distance_main = float(np.min(center_view))
-
-            # ========= [!!! 關鍵修復 V12：移除危險記憶 !!!] =========
-            # 只使用靜態門檻檢查
-            is_main_cam_clear = (min_clear_distance_main >= SCAN_CLEAR_THRESHOLD_MAIN)
-            # =========================================================
-
-            # --- 2. 檢查腳部攝影機 (0.2m 高度) ---
-            if "foot_depth" in obs:
-                down_depth = obs["foot_depth"]
-                h_f, w_f = down_depth.shape
-                center_foot_view = down_depth[:, int(w_f * 0.3):int(w_f * 0.7)]
-
-                # [!!! 關鍵修復 V12：使用靜態門檻 !!!]
-                floor_count = int(np.sum(center_foot_view < SCAN_CLEAR_THRESHOLD_FLOOR))
-                is_floor_cam_clear = (floor_count == 0)
-            else:
-                floor_count = 0
-                is_floor_cam_clear = True  # 沒有腳部相機就視為通過
-
-            # --- 3. 決策 ---
-            print(
-                f"[FSM-SCAN DEBUG] deg={i * TURN_ANGLE}: "
-                f"MainCamClear? {is_main_cam_clear} "
-                f"(Dist:{min_clear_distance_main:.2f}m, "
-                f"Req:{SCAN_CLEAR_THRESHOLD_MAIN:.2f}m), " # (V12: 更新 Log)
-                f"FloorCamClear? {is_floor_cam_clear} "
-                f"(FloorObstacles:{floor_count})"             # (V12: 更新 Log)
-            )
-
-            # [!!! 關鍵修復 V12：簡化判斷 !!!]
-            # 必須「同時」滿足：
-            # 1. 主攝影機看到的路徑 ≥ 0.25m
-            # 2. 腳部攝影機在 0.2m 危險區內沒有任何東西
-            if is_main_cam_clear and is_floor_cam_clear:
-                print(f"[FSM-SCAN] Found clear path at {i * TURN_ANGLE} deg.")
-                found_clear_path = True
-                break
-            
-            # 如果不滿足，就轉一步
-            obs = navigateAndSee(env, escape_action, target_mask); frame_count += 1
-
-        if not found_clear_path:
-            print(f"[FSM-SCAN] WARN: Scan {escape_action} failed (180 deg).")
-            scan_attempts += 1
-            escape_action = "turn_right" if escape_action == "turn_left" else "turn_left"  # 換邊
-            continue  # 回到 while 迴圈頂部，嘗試反向掃描
-
-
-        # --- 4. Commit (Corrected Logic) ---
-        # [!!! V12: 使用傳入的 commit_distance_m (例如 0.15m) !!!]
-        print(f"[FSM-COMMIT] Path found. Committing forward {commit_distance_m}m...")
-        escape_steps = 0
-        commit_succeeded = False
-        
-        # [!!! 致命 BUG 修正 !!!] (你原本的 L497-L498 是正確的)
-        # 檢查 "近" 像素，而不是 "遠" 像素
-        current_depth = obs["depth"]
-        current_near_pixels = np.sum(current_depth < 0.2)
-
-        if current_near_pixels < proactive_avoidance_threshold:
-            max_escape_steps = max(1, int(commit_distance_m / FORWARD_STEP))
-            stuck_pos_during_escape = env.agent.get_state().position.copy()
-
-            for _ in range(max_escape_steps):
-                obs = navigateAndSee(env, "move_forward", target_mask); frame_count += 1
-                escape_steps += 1
-                
-                current_depth = obs["depth"]
-                current_near_pixels = np.sum(current_depth < 0.2)
-                
-                if current_near_pixels > proactive_avoidance_threshold:
-                    print(f"[FSM-COMMIT] FAILED: Hit new obstacle during commit (near={current_near_pixels}).")
-                    break # 停止 "commit"
-                
-                new_pos = env.agent.get_state().position
-                if escape_steps > 5 and np.linalg.norm(new_pos - stuck_pos_during_escape) < 0.01:
-                    print("[FSM-COMMIT] FAILED: Physically stuck during commit.")
-                    break
-                stuck_pos_during_escape = new_pos
-            else:
-                # 'for' 迴圈正常完成 (沒有 break)
-                print(f"[FSM-COMMIT] SUCCESS: Commit complete ({commit_distance_m}m).")
-                commit_succeeded = True
-        else:
-            print(f"[FSM-COMMIT] FAILED: Front is blocked (near={current_near_pixels}). Cannot commit.")
-            
-        # --- 5. FSM Loop Check ---
-        if commit_succeeded:
-            print("[FSM] Escape Successful. Exiting FSM.")
-            return obs, frame_count # 成功！
-        else:
-            print("[FSM] LOOP: Commit failed. Looping back to SCAN_TURN.")
-            # 迴圈將自動繼續，回到 "Scan_Turn" 狀態
-            # 但我們需要換個方向，否則會卡住
-            scan_attempts += 1
-            escape_action = "turn_right" if escape_action == "turn_left" else "turn_left" 
-            
-    # 如果 while 迴圈用盡 (掃描 360 度都失敗了)
-    print("[FSM] PANIC: All scan and commit attempts failed. Escaping failed.")
-    return obs, frame_count
-# [!!! END OF V12 修復版 !!!]
-# #########################################
-
-
-
-def run_navigation_replan(env, binary_map, color_map, bounds, start_pixel_orig, goal_pixel_orig, target_mask,
-                        output_video="result_replan.mp4", replan_thresh=0.3, segment_distance_m=1.0,
-                        # --- Avoidance Params ---
-                        proactive_avoidance_threshold=50,
-                        escape_backward_dist=0.25,
-                        escape_turn_angle=30,         # 'Peek' 使用這個角度
-                        escape_commit_distance_m=0.15,
-                        # --- Controller Params ---
-                        look_ahead_points=5,
-                        turn_threshold_deg=5.0,
-                        stuck_threshold=5):
-    
+def run_navigation_simple(env, world_path, target_mask_func,
+                          lookahead=LOOKAHEAD_DISTANCE,
+                          angle_thresh_deg=CORRECTION_ANGLE_THRESH,
+                          max_actions=MAX_ACTIONS):
     """
-    Main navigation loop (V8 - Refactored Smart Escape):
-    - Implements "peek left/right" logic in a helper function.
-    - Uses new oscillation detection logic.
-    - Calls the *same* helper function for *both* proactive avoidance and stuck/oscillation.
+    無腦循跡：對齊->前進->重複。無任何避障/卡住處理。
+    world_path: [(x_world, z_world), ...]
     """
-    frame_count = 0
-    h, w = binary_map.shape
+    assert len(world_path) >= 1, "world_path 不可為空"
+    actions = 0
+    carrot_idx = 0  # 從路徑開頭往前找胡蘿蔔點
 
-    # === 1. Initialization & Subgoal Generation (Unchanged) ===
-    print("[INFO] Starting initial path planning (for subgoal generation)...")
-    initial_path_pixel, _ = rrt_star_planning(binary_map, start_pixel_orig, goal_pixel_orig)
-    if initial_path_pixel is None:
-        print("[FAIL] Initial RRT* planning failed. Cannot start navigation.")
-        return
-    initial_world_path = [pixel_to_world(u, v, w, h, bounds) for (u, v) in initial_path_pixel]
-    if not initial_world_path:
-        print("[FAIL] Initial world path is empty. Cannot start navigation.")
-        return
-    subgoals = create_subgoals(initial_world_path, segment_distance_m)
-    subgoals = subgoals[1:] # Remove start point
-    if not subgoals: 
-        subgoals = [initial_world_path[-1]]
+    # 先確保朝向路徑第二點（如果有）
+    if len(world_path) >= 2:
+        st = env.agent.get_state()
+        dx = world_path[1][0] - world_path[0][0]
+        dz = world_path[1][1] - world_path[0][1]
+        init_yaw = math.atan2(-dx, -dz)
+        quat = np.array([0.0, math.sin(init_yaw / 2.0), 0.0, math.cos(init_yaw / 2.0)], dtype=np.float32)
+        st.rotation = quat
+        env.agent.set_state(st)
 
-    # === 2. Main Loop (Outer) ===
-    current_subgoal_index = 0
-    global_replan_count = 0
-    
-    # Get initial observation (obs)
-    try:
-        obs = env.step("turn_right")
-        obs = env.step("turn_left") # Turn back, get current view
-    except Exception as e_init_obs:
-        print(f"[ERROR] Could not get initial observation: {e_init_obs}")
-        return
+    while actions < max_actions:
+        st = env.agent.get_state()
+        pos = st.position.copy()   # [x, y, z]
+        curr_yaw = get_current_yaw_rad(env)
 
-    try:
-        while current_subgoal_index < len(subgoals):
+        # 抵達判定（對世界座標的終點）
+        gx, gz = world_path[-1]
+        if math.hypot(gx - pos[0], gz - pos[2]) <= ARRIVAL_THRESH:
+            # 顯示最後一幀讓你看
+            _ = navigateAndSee(env, "turn_left", target_mask_func)  # 隨便觸發一次刷新
+            break
 
-            # --- 2a. Set Current Segment Target ---
-            current_target_subgoal_world = subgoals[current_subgoal_index]
-            current_target_subgoal_pixel = world_to_pixel(current_target_subgoal_world[0], current_target_subgoal_world[1], w, h, bounds)
-            print(f"\n========== [Navigating to Subgoal {current_subgoal_index}/{len(subgoals)-1}] ==========")
-            print(f"Target World Coords: ({current_target_subgoal_world[0]:.2f}, {current_target_subgoal_world[1]:.2f})")
+        # 選胡蘿蔔點（前視 lookahead 公尺）
+        tx, tz, carrot_idx = find_lookahead_point(world_path, (pos[0], pos[2]), carrot_idx, lookahead)
 
-            # --- 2b. Plan Current Path Segment ---
-            current_state = env.agent.get_state()
-            current_pos = current_state.position.copy()
-            current_pixel = world_to_pixel(current_pos[0], current_pos[2], w, h, bounds)
-            
-            path_pixel_segment, _ = rrt_star_planning(binary_map, current_pixel, current_target_subgoal_pixel)
-            retry_segment = 0
-            while path_pixel_segment is None and retry_segment < 3:
-                print(f"[WARN] Cannot plan path to subgoal {current_subgoal_index}, retrying ({retry_segment+1}/3)...")
-                path_pixel_segment, _ = rrt_star_planning(binary_map, current_pixel, current_target_subgoal_pixel)
-                retry_segment += 1
-            if path_pixel_segment is None:
-                print(f"[FAIL] Failed to plan path to subgoal {current_subgoal_index} after retries. Aborting.")
-                return
+        # 角度誤差
+        desired_yaw = yaw_to_target_rad(pos, tx, tz)
+        yaw_err = wrap_to_pi(desired_yaw - curr_yaw)
+        yaw_err_deg = math.degrees(yaw_err)
 
-            current_segment_world_path = [pixel_to_world(u, v, w, h, bounds) for (u, v) in path_pixel_segment]
-            if not current_segment_world_path:
-                print(f"[FAIL] Path segment for subgoal {current_subgoal_index} is empty. Aborting.")
-                return
-            
-            # --- 2c. Inner Loop: Reactive Navigation ---
-            subgoal_reached = False
-            progress_idx = 0
-            stuck_check_counter = 0 # 這是新的計時器
-            stuck_check_pos_start = current_pos.copy() # 這是新的起始位置
+        # 轉 or 走
+        if abs(yaw_err_deg) > angle_thresh_deg:
+            action = "turn_left" if yaw_err < 0 else "turn_right"
+        else:
+            action = "move_forward"
 
-            local_replan_count_this_segment = 0
+        _ = navigateAndSee(env, action, target_mask_func)
+        actions += 1
 
-            while not subgoal_reached:
-                
-                # --- (1) Get Current State ---
-                state = env.agent.get_state()
-                pos = state.position.copy()
-                q = state.rotation
-                current_yaw = 2 * math.atan2(q.imag[1], q.real)
-                
-                # --- (2) Check Arrival ---
-                dist_to_current_subgoal = math.hypot(pos[0] - current_target_subgoal_world[0], pos[2] - current_target_subgoal_world[1])
-                if dist_to_current_subgoal < ARRIVAL_JUDGE * 4: # Reached subgoal
-                    print(f"[INFO] Reached Subgoal {current_subgoal_index} ({current_target_subgoal_world[0]:.2f}, {current_target_subgoal_world[1]:.2f})")
-                    subgoal_reached = True
-                    break # Exit inner loop, move to next subgoal
+    # 抵達後轉正對終點（世界座標版）
+    face_world_goal(env, world_path[-1], target_mask_func)
 
-                # ========== [!!! V9 FIX !!!] ==========
-                # --- (3) Check for Proactive Obstacle Avoidance ---
-                # ** 關鍵修正: **
-                # 我們現在使用來自 *上一個迴圈* (L247) 的 `obs` 變數
-                # 不再呼叫 env.step("turn_left") / env.step("turn_right")
-                
-                depth = obs["depth"]
-                near_pixels, roi_area = count_near_pixels(depth, near_m=0.25)
-                proactive_avoidance_threshold = int(0.02 * roi_area)  # 2%
-                print(f"[DEPTH] near<{0.25}m: {near_pixels}/{roi_area} (thr={proactive_avoidance_threshold})")
-                if near_pixels > proactive_avoidance_threshold:
-                    print(f"[AVOID] Proactive obstacle detected (near={near_pixels} > {proactive_avoidance_threshold}).")
-                    
-                    # 呼叫 *更新後* 的脫困函式
-                    obs, frame_count = _execute_smart_escape(
-                        env, escape_turn_angle, escape_backward_dist, proactive_avoidance_threshold,
-                        target_mask, frame_count, FPS, FORWARD_STEP, TURN_ANGLE,
-                        commit_distance_m=escape_commit_distance_m # 傳入新參數
-                    )
-                    
-                    print("[AVOID] Maneuver complete. Forcing replan...")
-                    break # 退出內層 while 迴圈，觸發 RRT* 重新規劃
-                # ========== END OF V8 AVOIDANCE LOGIC ==========
+def face_world_goal(env, world_goal_xz, target_mask_func, TURN_ANGLE=TURN_ANGLE):
+    """
+    終點朝向校正（世界座標版，不需要像素/bounds）
+    """
+    pos = env.agent.get_state().position.copy()
+    dx = world_goal_xz[0] - pos[0]
+    dz = world_goal_xz[1] - pos[2]
+    desired_yaw = math.atan2(-dx, -dz)
 
+    q = env.agent.get_state().rotation
+    current_yaw = 2 * math.atan2(q.imag[1], q.real)
+    yaw_diff = wrap_to_pi(desired_yaw - current_yaw)
+    steps = int(abs(math.degrees(yaw_diff)) // TURN_ANGLE)
 
-                # --- (4) Check Deviation ---
-                dists_all = [math.hypot(px - pos[0], pz - pos[2]) for (px, pz) in current_segment_world_path[progress_idx:]]
-                if not dists_all:
-                    print("[WARN] Path points exhausted but subgoal not reached. Forcing replan.")
-                    break 
-                
-                nearest_local_idx = int(np.argmin(dists_all))
-                current_dist_to_path = dists_all[nearest_local_idx]
-                progress_idx += nearest_local_idx # Update progress along path
-
-                if current_dist_to_path > replan_thresh:
-                    print(f"[REPLAN] Deviated from path ({current_dist_to_path:.2f} m > {replan_thresh}m). Forcing replan.")
-                    break # Exit inner loop to trigger replan
-
-                # --- (5) Decision: Turn or Move (Pure Pursuit) ---
-                look_ahead_idx = min(progress_idx + look_ahead_points, len(current_segment_world_path) - 1)
-                target_point = current_segment_world_path[look_ahead_idx]
-
-                dx, dz = target_point[0] - pos[0], target_point[1] - pos[2]
-                desired_yaw = math.atan2(-dx, -dz) # Use consistent yaw calculation
-                
-                yaw_diff_rad = wrap_to_pi(desired_yaw - current_yaw)
-                angle_diff_deg = abs(math.degrees(yaw_diff_rad))
-
-                action_to_take = ""
-                if angle_diff_deg > turn_threshold_deg:
-                    # Turn to align
-                    action_to_take = "turn_right" if yaw_diff_rad < 0 else "turn_left"
-                    print(f"[NAV] Aligning. Diff: {angle_diff_deg:.1f} deg > {turn_threshold_deg} deg. Action: {action_to_take}")
-                    stuck_check_counter = 0
-                    stuck_check_pos_start = pos.copy()
-                else:
-                    # Alignmenet is good, move forward
-                    action_to_take = "move_forward"
-                    print(f"[NAV] Moving forward. Diff: {angle_diff_deg:.1f} deg")
-                    stuck_check_counter += 1
-
-                # ========== [!!! MODIFIED V8 LOGIC !!!] ==========
-                
-                if stuck_check_counter > stuck_threshold:
-                    # 時間到了，檢查一下
-                    move_dist_since_check = np.linalg.norm(pos - stuck_check_pos_start)
-                    
-                    if move_dist_since_check < 0.1: # 在 N 幀內移動不到 10 公分
-                        print(f"[REPLAN] Agent stuck (oscillation or unseen obstacle).")
-                        print(f"[REPLAN] Moved < 0.1m in {stuck_threshold} frames. Initiating smart escape...")
-
-                        # 呼叫 *相同* 的脫困函式
-                        obs, frame_count = _execute_smart_escape(
-                            env, escape_turn_angle, escape_backward_dist, proactive_avoidance_threshold,
-                            target_mask, frame_count, FPS, FORWARD_STEP, TURN_ANGLE,
-                            commit_distance_m=escape_commit_distance_m
-                        )
-
-                        print("[REPLAN] (Stuck) Escape complete. Forcing replan from new position.")
-                        break # 退出內層迴圈以觸發 replan
-                    
-                    # 如果 *有* 移動，則重置計數器
-                    stuck_check_counter = 0
-                    stuck_check_pos_start = pos.copy()
-                # ========== [!!! END OF V9 FIX !!!] ==========
-
-                # --- (7) Execute Action & Record Video ---
-                obs = navigateAndSee(env, action_to_take, target_mask)
-                frame_count += 1
-
-            # --- Inner loop finished ---
-
-            if subgoal_reached:
-                # Success, move to next subgoal
-                current_subgoal_index += 1
-                progress_idx = 0 
-            else:
-                # Replan triggered (Avoidance, Deviation, Stuck, or Path End)
-                print(f"--- [Triggering Replan for Subgoal {current_subgoal_index}] ---")
-                global_replan_count += 1
-                local_replan_count_this_segment += 1
-                if local_replan_count_this_segment > 10:
-                    print(f"[FAIL] Replan limit exceeded for subgoal {current_subgoal_index}. Aborting.")
-                    return
-
-        # --- Outer loop finished (all subgoals reached) ---
-        
-        print("[INFO] All subgoals completed. Executing final turn to goal...")
-        face_goal(env, goal_pixel_orig, bounds, w, h, target_mask, FPS)
-
-    except KeyboardInterrupt:
-        print("\n[INTERRUPT] User interrupted. Saving video...")
-    except Exception as e:
-        import traceback
-        print(f"\n[UNCAUGHT ERROR] {type(e).__name__}: {e}")
-        print(traceback.format_exc())
-        print("[CRITICAL] Saving current video and exiting.")
-    finally:
-        # --- Cleanup ---
-        cv2.destroyAllWindows()
-        print(f"[END] Navigation finished.")
-        print(f"[SAVE] Video safely saved ({frame_count} frames)")
-        try:
-            env.sim.close()
-            print("[CLEANUP] Simulator closed.")
-        except Exception as e_close:
-            print(f"[WARN] Error closing simulator: {e_close}")
-
-    print(f"[END] Navigation finished after {global_replan_count} total replan rounds.")
+    turn_action = "turn_left" if yaw_diff < 0 else "turn_right"
+    for _ in range(max(1, steps)):
+        _ = navigateAndSee(env, turn_action, target_mask_func)
 
 # ==========================================================
 # 主程式
@@ -1020,17 +681,8 @@ if __name__ == "__main__":
 
     # === ✅ 步驟 3: 執行 V3 統一控制器 ===
     video_path = f"{OUTPUT_PATH}/{target_class}_V3_controller.mp4"
-    run_navigation_replan(env, binary_map, color_map, bounds, start, goal, target_mask,
-                output_video=video_path, replan_thresh=0.3, segment_distance_m=1.0,
-                # --- 避障參數 ---
-                proactive_avoidance_threshold=50,
-                escape_backward_dist=0.5,
-                escape_commit_distance_m=0.15,
-                escape_turn_angle=45,
-                # --- 新增：控制器參數 ---
-                look_ahead_points=5,       # Pure Pursuit: 預瞄路徑上未來第幾個點
-                turn_threshold_deg=5.0,    # 角度偏差 > 5° 才轉彎
-                stuck_threshold=5)
+    run_navigation_simple(env, world_path, target_mask)
+
 
     visualize_path_on_map(MAP_PATH, path, goal, start, target_class, OUTPUT_PATH, save_prefix="rrt_result_V3_initial")
     env.sim.close()

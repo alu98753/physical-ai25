@@ -59,13 +59,94 @@ def your_fk(DH_params : dict, q : list or tuple or np.ndarray, base_pos) -> np.n
     
     #### your code ####
     
-
-    # A = ? # may be more than one line
-    # jacobian = ? # may be more than one line
-
-    raise NotImplementedError
-    # hint : 
-    # https://automaticaddison.com/the-ultimate-guide-to-jacobian-matrices-for-robotics/
+    # Store all intermediate transformation matrices for Jacobian calculation
+    T_matrices = [A.copy()]  # T_0 = base transformation
+    
+    # Compute Forward Kinematics - accumulate transformations
+    for i in range(6):  # 6 joints
+        # Get DH parameters for joint i
+        a = DH_params[i]['a']
+        d = DH_params[i]['d']
+        alpha = DH_params[i]['alpha']
+        theta = q[i]
+        
+        # Compute individual transformation matrices (Classic DH Convention)
+        # A_i = Rot_z(theta) * Trans_z(d) * Trans_x(a) * Rot_x(alpha)
+        
+        # Rot_z(theta)
+        ct = np.cos(theta)
+        st = np.sin(theta)
+        Rot_z = np.array([
+            [ct, -st, 0, 0],
+            [st,  ct, 0, 0],
+            [0,   0,  1, 0],
+            [0,   0,  0, 1]
+        ])
+        
+        # Trans_z(d)
+        Trans_z = np.array([
+            [1, 0, 0, 0],
+            [0, 1, 0, 0],
+            [0, 0, 1, d],
+            [0, 0, 0, 1]
+        ])
+        
+        # Trans_x(a)
+        Trans_x = np.array([
+            [1, 0, 0, a],
+            [0, 1, 0, 0],
+            [0, 0, 1, 0],
+            [0, 0, 0, 1]
+        ])
+        
+        # Rot_x(alpha)
+        ca = np.cos(alpha)
+        sa = np.sin(alpha)
+        Rot_x = np.array([
+            [1,  0,   0,  0],
+            [0, ca, -sa, 0],
+            [0, sa,  ca, 0],
+            [0,  0,   0, 1]
+        ])
+        
+        # Compute A_i (transformation from frame i-1 to frame i)
+        A_i = Rot_z @ Trans_z @ Trans_x @ Rot_x
+        
+        # Update total transformation: A = A * A_i
+        A = A @ A_i
+        
+        # Store intermediate transformation for Jacobian calculation
+        T_matrices.append(A.copy())
+    
+    # Now A contains T_6^W (transformation from world to end-effector)
+    # T_matrices contains [T_0, T_1, T_2, T_3, T_4, T_5, T_6]
+    
+    # Compute Geometric Jacobian
+    # For revolute joints: J_i = [J_v_i; J_omega_i]
+    # where J_omega_i = z_{i-1}
+    #       J_v_i = z_{i-1} x (p_E - p_{i-1})
+    
+    # Get end-effector position (before adjustment)
+    p_E = A[0:3, 3]
+    
+    # Compute Jacobian columns for each joint
+    for i in range(6):
+        # Get transformation matrix for frame i-1 (note: i=0 corresponds to base)
+        T_i_minus_1 = T_matrices[i]
+        
+        # Extract z-axis (3rd column of rotation part) and position
+        z_i_minus_1 = T_i_minus_1[0:3, 2]
+        p_i_minus_1 = T_i_minus_1[0:3, 3]
+        
+        # Compute linear velocity part: J_v = z x (p_E - p)
+        J_v_i = cross(z_i_minus_1, p_E - p_i_minus_1)
+        
+        # Compute angular velocity part: J_omega = z
+        J_omega_i = z_i_minus_1
+        
+        # Fill in the i-th column of Jacobian
+        jacobian[0:3, i] = J_v_i
+        jacobian[3:6, i] = J_omega_i
     
     ###############################################
 
@@ -126,7 +207,7 @@ def score_fk(robot, testcase_files : str, visualize : bool=False):
             fk_error = np.linalg.norm(your_pose - np.asarray(gt_pose), ord=2)
             
             
-     
+    
             if fk_error > FK_ERROR_THRESH:
                 fk_score[file_id] -= penalty
                 fk_error_cnt[file_id] += 1
