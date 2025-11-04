@@ -74,17 +74,58 @@ def your_ik(robot_id, new_pose : list or tuple or np.ndarray,
     
     #### your code ####
 
-    # TODO: update tmp_q
-    # tmp_q = ? # may be more than one line
-
-    # hint : 
-    # 1. You may use `your_fk` function and jacobian matrix to do this
-    # 2. Be careful when computing the delta x
-    # 3. You may use some hyper parameters (i.e., step rate) in optimization loops
+    # === 階段一：初始化 ===
+    # 獲取 D-H 參數
+    dh_params = get_ur5_DH_params()
+    
+    # 設定當前關節角度（重要：使用 .copy() 避免修改原始值）
+    q_current = tmp_q.copy()
+    
+    # 設定步長（超參數，可調整）
+    step_rate = 0.1
+    
+    # === 階段二：迭代優化 ===
+    for iteration in range(max_iters):
+        # 2A. 呼叫 FK 獲得當前姿態和雅可比矩陣
+        current_pose_7d, J = your_fk(dh_params, q_current, base_pos)
+        
+        # 2B. 計算誤差向量
+        # 2B-1. 位置誤差（簡單的向量相減）
+        delta_p = new_pose[:3] - current_pose_7d[:3]
+        
+        # 2B-2. 姿態誤差（四元數 → 旋轉矩陣 → 旋轉向量）
+        # 將四元數轉換為旋轉矩陣
+        R_target = R.from_quat(new_pose[3:]).as_matrix()
+        R_current = R.from_quat(current_pose_7d[3:]).as_matrix()
+        
+        # 計算誤差旋轉矩陣
+        R_error = R_target @ R_current.T
+        
+        # 轉換為旋轉向量（軸角表示）
+        delta_o = R.from_matrix(R_error).as_rotvec()
+        
+        # 2B-3. 組合成 6D 誤差向量
+        delta_x = np.concatenate([delta_p, delta_o])
+        
+        # 2C. 檢查收斂條件
+        error_norm = np.linalg.norm(delta_x)
+        if error_norm < stop_thresh:
+            break  # 已經足夠接近目標，提前結束
+        
+        # 2D. 計算關節增量（雅可比偽逆法）
+        J_pinv = pinv(J)
+        delta_q = J_pinv @ delta_x
+        
+        # 2E. 更新關節角度（帶步長控制）
+        q_current = q_current + step_rate * delta_q
+        
+        # === 階段三：應用關節限制 ===
+        q_current = np.clip(q_current, joint_limits[:, 0], joint_limits[:, 1])
+    
+    # 更新 tmp_q 為求解結果
+    tmp_q = q_current
 
     ###################
-    
-    raise NotImplementedError
 
     return list(tmp_q) # 6 DoF
 
