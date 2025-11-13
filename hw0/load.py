@@ -9,7 +9,13 @@ import cv2
 # This is the scene we are going to load.
 # support a variety of mesh formats, such as .glb, .gltf, .obj, .ply
 ### put your scene path ###
+# 修改前（Line 16）
 test_scene = "replica_v1/apartment_0/habitat/mesh_semantic.ply"
+
+# 修改後
+import os
+script_dir = os.path.dirname(os.path.abspath(__file__))
+test_scene = os.path.join(script_dir, "replica_v1/apartment_0/habitat/mesh_semantic.ply")   
 
 sim_settings = {
     "scene": test_scene,  # Scene path

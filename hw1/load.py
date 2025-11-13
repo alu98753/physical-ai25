@@ -13,8 +13,9 @@ import shutil
 # This is the scene we are going to load.
 # support a variety of mesh formats, such as .glb, .gltf, .obj, .ply
 ### put your scene path ###
-test_scene = "replica_v1/apartment_0/habitat/mesh_semantic.ply"
-
+import os
+script_dir = os.path.dirname(os.path.abspath(__file__))
+test_scene = os.path.join(script_dir, "replica_v1/apartment_0/habitat/mesh_semantic.ply")
 sim_settings = {
     "scene": test_scene,  # Scene path
     "default_agent": 0,  # Index of the default agent
