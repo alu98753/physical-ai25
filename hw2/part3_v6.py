@@ -656,6 +656,129 @@ def count_near_pixels_robust(depth, near_m=0.27, min_blob_area=200):
     return cnt, roi.size, cnt / max(1, roi.size)
 
 
+def navigate_simple_turn_move(
+    env,                    # HabitatEnvWrapper
+    world_path,            # [(x, z), ...] 世界座標路徑
+    target_mask_func,      # target_mask 函數
+    goal_pixel,           # 最終目標像素座標
+    bounds,               # 座標邊界
+    w, h,                 # 地圖寬高
+    video_writer=None,    # 錄影器
+    dist_tol=0.40,        # 抵達航點的距離閾值（米）
+    yaw_tol_deg=4.0,      # 對準的角度容忍度（度）
+    max_actions=5000      # 最大動作數
+):
+    """
+    簡單的 Turn-then-Move 導航策略，逐個航點導航。
+    類似 main.py 的 navigate_with_world_coords，但適配 part3_v6.py 的環境。
+    """
+    assert len(world_path) >= 2, "world_path 至少要有 2 個點"
+    
+    # 計算目標世界座標（用於最終抵達檢查）
+    goalx, goalz = pixel_to_world(goal_pixel[0], goal_pixel[1], w, h, bounds)
+    
+    # 計算初始狀態
+    astate = env.agent.get_state()
+    pos = astate.position.copy()
+    current_pos_xz = (pos[0], pos[2])
+    current_yaw = get_yaw_from_quat(astate.rotation)
+    
+    # 計算期望 yaw 的輔助函數
+    def get_desired_yaw(current_pos_xz, target_pos_xz):
+        dx = target_pos_xz[0] - current_pos_xz[0]
+        dz = target_pos_xz[1] - current_pos_xz[1]
+        return math.atan2(-dx, -dz)
+    
+    yaw_tol = math.radians(yaw_tol_deg)
+    
+    # 初始化：從第二個航點開始（第一個是起點）
+    path = world_path
+    N = len(path)
+    i = 1
+    actions = 0
+    
+    # 獲取初始觀測（在設置初始狀態後）
+    # 注意：初始狀態應該在調用此函數之前已經設置好
+    obs = env.sim.get_sensor_observations()
+    
+    while i <= N and actions < max_actions:
+        astate = env.agent.get_state()
+        pos = astate.position.copy()
+        current_pos_xz = (pos[0], pos[2])
+        current_yaw = get_yaw_from_quat(astate.rotation)
+        
+        # 檢查是否已到達最終目標（優先檢查）
+        final_dist = math.hypot(pos[0] - goalx, pos[2] - goalz)
+        if final_dist <= dist_tol:
+            print(f"Final goal reached! Distance: {final_dist:.2f}m")
+            face_goal(video_writer, env, goal_pixel, bounds, w, h, target_mask_func)
+            print("[DONE] Arrived goal.")
+            return
+        
+        # 如果已抵達所有航點，朝向最終目標導航
+        if i >= N:
+            # 朝向最終目標
+            desired_yaw = get_desired_yaw(current_pos_xz, (goalx, goalz))
+            dyaw = wrap_to_pi(desired_yaw - current_yaw)
+            
+            print(f"[nav] pos=({pos[0]:.2f},{pos[2]:.2f}) -> final_goal=({goalx:.2f},{goalz:.2f}). dist={final_dist:.2f}, dyaw={math.degrees(dyaw):.1f}°")
+            
+            if abs(dyaw) > yaw_tol:
+                # 尚未對準最終目標，轉向
+                action_to_take = "turn_left" if dyaw > 0 else "turn_right"
+            else:
+                # 已對準，前進
+                action_to_take = "move_forward"
+        else:
+            # 正常航點導航
+            target_pos_xz = path[i]
+            
+            # 計算距離和角度差
+            dx_world = target_pos_xz[0] - current_pos_xz[0]
+            dz_world = target_pos_xz[1] - current_pos_xz[1]
+            dist_to_target = math.hypot(dx_world, dz_world)
+            desired_yaw = get_desired_yaw(current_pos_xz, target_pos_xz)
+            dyaw = wrap_to_pi(desired_yaw - current_yaw)
+            
+            print(f"[nav] pos=({pos[0]:.2f},{pos[2]:.2f}) -> target[{i}]=({target_pos_xz[0]:.2f},{target_pos_xz[1]:.2f}). dist={dist_to_target:.2f}, dyaw={math.degrees(dyaw):.1f}°")
+            
+            # 決策邏輯
+            action_to_take = None
+            
+            if dist_to_target <= dist_tol:
+                # 情況 A: 已抵達航點
+                print(f"Reached waypoint {i}. Moving to next.")
+                i += 1
+                continue  # 繼續下一個循環，檢查是否到達最終目標
+            
+            elif abs(dyaw) > yaw_tol:
+                # 情況 B: 尚未對準
+                action_to_take = "turn_left" if dyaw > 0 else "turn_right"
+            
+            else:
+                # 情況 C: 已對準，尚未抵達
+                action_to_take = "move_forward"
+        
+        # 執行動作
+        if action_to_take:
+            obs = navigateAndSee(env, action_to_take, target_mask_func, video_writer)
+            actions += 1
+            
+            # 碰撞檢測：檢查是否卡住
+            if action_to_take == "move_forward":
+                new_pos = env.agent.get_state().position
+                if np.linalg.norm(new_pos - pos) < 1e-4:
+                    print("[WARN] No progress, possibly stuck. Trying to turn...")
+                    obs = navigateAndSee(env, "turn_right", target_mask_func, video_writer)
+                    obs = navigateAndSee(env, "turn_right", target_mask_func, video_writer)
+                    actions += 2
+    
+    if actions >= max_actions:
+        print("[TIMEOUT] Max actions reached; stopping.")
+    else:
+        print("[WARN] Navigation loop ended unexpectedly.")
+
+
 def run_navigation(env,
                 world_path,           # [(x,z), ...]
                 bounds,               # 給 face_goal 用
@@ -1143,21 +1266,26 @@ class RRTWorld:
 
 # ----------（可選）用 Geodesic 路徑把 RRT 的折線「貼緊 NavMesh」 ----------
 def geodesic_bridge(sim, A, B, step=0.15):
-    sp = sim.pathfinder.get_path(A, B)  # 若舊版無此API，改用 ShortestPath 求 sp.points
-    if getattr(sp, "points", None) and len(sp.points) >= 2:
+    """使用正確的 ShortestPath API 來獲取兩點間的 geodesic 路徑"""
+    sp = habitat_sim.ShortestPath()
+    sp.requested_start = np.array([A[0], 0.0, A[1]], dtype=np.float32)
+    sp.requested_end = np.array([B[0], 0.0, B[1]], dtype=np.float32)
+    found = sim.pathfinder.find_path(sp)
+    
+    if found and len(sp.points) >= 2:
         pts = [(p[0], p[2]) for p in sp.points]
         # 重採樣成等距點，方便控制器（步長 step）
         out = [pts[0]]
-        acc = 0.0
         for i in range(len(pts)-1):
-            dx = pts[i+1][0]-pts[i][0]; dz = pts[i+1][1]-pts[i][1]
-            seg = max(1e-6, math.hypot(dx,dz))
+            dx = pts[i+1][0]-pts[i][0]
+            dz = pts[i+1][1]-pts[i][1]
+            seg = max(1e-6, math.hypot(dx, dz))
             k = max(1, int(seg/step))
             for t in range(1, k+1):
                 r = t/k
                 out.append((pts[i][0]+dx*r, pts[i][1]+dz*r))
         return out
-    return [A, B]
+    return [A, B]  # 如果找不到路徑，直接返回兩點
 
 def geodesic_refine_polyline(sim, coarse_path, step=0.15):
     refined = [coarse_path[0]]
@@ -1286,23 +1414,35 @@ if __name__ == "__main__":
     cv2.imwrite(os.path.join(OUTPUT_PATH, f"world_rrt_path_{target_class}.png"), vis)
     print(f"[INFO] 已輸出像素地圖視覺化：{OUTPUT_PATH}/world_rrt_path_{target_class}.png")
 
-    # === 初始化 agent 朝向：面向路徑第二點 ===
-    snap = env.sim.pathfinder.snap_point(np.array([start_world[0], 0.0, start_world[1]], dtype=np.float32))
+    # === 初始化 agent 位置和朝向：直接設置，面向路徑第一個航點 ===
+    # 使用 snap_point 獲取正確的高度，但直接設置位置和朝向
+    start_pos_3d = np.array([start_world[0], 0.0, start_world[1]], dtype=np.float32)
+    snapped = env.sim.pathfinder.snap_point(start_pos_3d)
+    
+    # 計算初始朝向：面向路徑的第一個航點（第二個點）
     if len(path_world) >= 2:
-        dx = path_world[1][0] - float(snap[0])
-        dz = path_world[1][1] - float(snap[2])
+        dx = path_world[1][0] - start_world[0]
+        dz = path_world[1][1] - start_world[1]
         init_yaw = math.atan2(-dx, -dz)
     else:
         init_yaw = 0.0
-    env.reset_to([float(snap[0]), 0.0, float(snap[2])], init_yaw)
-
+    
+    # 直接設置位置和朝向（使用 snap 後的高度）
+    st = habitat_sim.AgentState()
+    st.position = snapped  # 使用 snap 後的位置（包含正確的高度）
+    st.rotation = quat_from_angle_axis(init_yaw, np.array([0.0, 1.0, 0.0], dtype=np.float32))
+    env.agent.set_state(st)
+    
+    print(f"[RESET] Agent position set to: {snapped}, yaw={math.degrees(init_yaw):.1f}°")
+    
     # 檢查朝向品質
     s = env.agent.get_state()
     yaw = get_yaw_from_quat(s.rotation)
-    fwd = np.array([-math.sin(yaw), 0.0, -math.cos(yaw)])
-    to_next = np.array([dx, 0.0, dz]) if len(path_world) >= 2 else np.array([1.0,0.0,0.0])
-    cosang = float(np.dot(fwd, to_next) / (np.linalg.norm(fwd)*np.linalg.norm(to_next)+1e-9))
-    print(f"[CHECK] cos(angle to next waypoint) = {cosang:.3f}")
+    if len(path_world) >= 2:
+        fwd = np.array([-math.sin(yaw), 0.0, -math.cos(yaw)])
+        to_next = np.array([dx, 0.0, dz])
+        cosang = float(np.dot(fwd, to_next) / (np.linalg.norm(fwd)*np.linalg.norm(to_next)+1e-9))
+        print(f"[CHECK] cos(angle to next waypoint) = {cosang:.3f}")
 
     # === 錄影器設定 ===
     fourcc = cv2.VideoWriter_fourcc(*'mp4v')
@@ -1310,21 +1450,17 @@ if __name__ == "__main__":
     video_writer = cv2.VideoWriter(video_path, fourcc, FPS, (512, 512))
     cv2.namedWindow("Navigation (Overlay)", cv2.WINDOW_AUTOSIZE)
 
-    # === 導航（吃世界座標路徑） ===
-    run_navigation(
+    # === 導航（吃世界座標路徑）- 使用簡單的 Turn-then-Move 策略 ===
+    navigate_simple_turn_move(
         env,
         world_path=path_world,
-        bounds=bounds,
         target_mask_func=target_mask,  # 你的語義遮罩函式
         goal_pixel=goal_px,            # face_goal 仍需像素座標
+        bounds=bounds,
         w=w, h=h,
         video_writer=video_writer,
-        lookahead_m=0.05,
-        turn_on_deg=8.0,
-        turn_off_deg=3.0,
-        near_m=0.2,
-        near_ratio_thr=0.2,
-        arrival_thresh=ARRIVAL_THRESH,
+        dist_tol=0.10,                 # 抵達航點的距離閾值（米）
+        yaw_tol_deg=4.0,               # 對準的角度容忍度（度）
         max_actions=MAX_ACTIONS
     )
 
