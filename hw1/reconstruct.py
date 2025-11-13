@@ -250,7 +250,7 @@ def local_icp_algorithm(source_down, target_down, trans_init, voxel_size_reg, me
     t_start = time.time()
 
     # === 1️⃣ 固定 threshold（對齊優秀版本）===
-    threshold_icp = voxel_size_reg * 3.0  # 0.1 * 3 = 0.3（與優秀版本一致）
+    threshold_icp = voxel_size_reg * 1.5  # 0.1 * 3 = 0.3（與優秀版本一致）
     print(f"[INFO] Running Multi-scale Point-to-Plane ICP, threshold = {threshold_icp:.4f}")
 
     # === 2️⃣ 法向量檢查（點雲應該已經有法向量，但檢查一下）===
