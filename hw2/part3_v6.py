@@ -1340,6 +1340,54 @@ def find_nearest_clear_point(sim, start_xy, max_radius=2.0, step=0.05, clearance
     return None
 
 
+# ---------- 幫手：地圖檢查函數（限制規劃在白色區域） ----------
+def is_free_pixel_map(binary_map, x, y, radius=1.0):
+    """
+    檢查地圖上的點是否在白色可行走區域（像素值 >= 128）。
+    在 (x, y) 周圍取 9 個鄰點，必須所有鄰點都是 free 才視為 free。
+    """
+    H, W = binary_map.shape[:2]
+    cx, cy = int(round(x)), int(round(y))
+    
+    # 9 點 pattern (3x3 鄰域)
+    offsets = [
+        (0, 0),  # 中心
+        (-1, 0), (1, 0), (0, -1), (0, 1),  # 十字
+        (-1, -1), (-1, 1), (1, -1), (1, 1),  # 斜角
+    ]
+    
+    for dx, dy in offsets:
+        xx = int(round(cx + dx * radius))
+        yy = int(round(cy + dy * radius))
+        
+        # 檢查邊界：任何一個採樣點出界，都視為 "不安全"
+        if not (0 <= xx < W and 0 <= yy < H):
+            return False
+        
+        # 檢查障礙：任何一個採樣點碰到障礙 (< 128)，都視為 "不安全"
+        if binary_map[yy, xx] < 128:
+            return False
+    
+    # 迴圈跑完，代表所有 9 個點都在界內且都是 free
+    return True
+
+def line_collision_free_map(binary_map, p1_px, p2_px, step_px=2.0):
+    """
+    檢查地圖上的邊是否穿過障礙物。
+    p1_px, p2_px: 像素座標 (x, y)
+    """
+    x1, y1 = p1_px
+    x2, y2 = p2_px
+    dist = math.hypot(x2 - x1, y2 - y1)
+    n = max(2, int(math.ceil(dist / step_px)) + 1)
+    
+    xs = np.linspace(x1, x2, n)
+    ys = np.linspace(y1, y2, n)
+    for x, y in zip(xs, ys):
+        if not is_free_pixel_map(binary_map, x, y):
+            return False
+    return True
+
 # ---------- 幫手：線段「帶安全距離」檢查（掃掠圓盤） ----------
 def edge_collision_free_with_clearance(sim, A, B, clearance_m, step_m=0.05, side_samples=2, eps=0.03):
     """
@@ -1443,7 +1491,12 @@ class RRTWorld:
                  safe_weight=1000.0,  # 安全懲罰權重
                  goal_safety_exempt_dist=1.0,  # 接近目標時放寬安全距離（米）
                  use_rrt_star=True,  # 是否使用 RRT* 機制
-                 max_neighbors=50):  # 限制鄰居搜索數量（性能優化）
+                 max_neighbors=100,  # 限制鄰居搜索數量（性能優化）
+                 # 地圖限制參數（限制規劃在白色區域）
+                 binary_map=None,  # 二值化地圖（255=free, 0=obs）
+                 bounds=None,  # 地圖邊界
+                 w=None,  # 地圖寬度（像素）
+                 h=None):  # 地圖高度（像素）
         self.sim = sim
         self.step_m = step_m
         self.goal_rate = goal_sample_rate
@@ -1457,6 +1510,13 @@ class RRTWorld:
         self.goal_safety_exempt_dist = goal_safety_exempt_dist
         self.use_rrt_star = use_rrt_star
         self.max_neighbors = max_neighbors
+        
+        # 地圖限制參數
+        self.binary_map = binary_map
+        self.bounds = bounds
+        self.w = w
+        self.h = h
+        self.use_map_constraint = (binary_map is not None and bounds is not None and w is not None and h is not None)
 
         self.nodes = []       # [(x,z)]
         self.parent = {}      # child_idx -> parent_idx
@@ -1464,12 +1524,22 @@ class RRTWorld:
         self.distance_cache = {}  # 緩存距離查詢結果
 
     def _sample_free_with_clearance(self, bounds=None):
-        # 簡單策略：從 navmesh 取隨機點，直到通過 clearance 檢查
+        # 策略：從 navmesh 取隨機點，直到通過 clearance 檢查和地圖檢查
         for _ in range(self.node_retry):
             p = self.sim.pathfinder.get_random_navigable_point()
             x, z = float(p[0]), float(p[2])
-            if point_has_clearance(self.sim, x, z, self.clearance_m, dirs=4):
-                return (x, z)
+            
+            # 檢查 NavMesh clearance
+            if not point_has_clearance(self.sim, x, z, self.clearance_m, dirs=4):
+                continue
+            
+            # 如果啟用地圖限制，檢查點是否在地圖的白色區域
+            if self.use_map_constraint:
+                u, v = world_to_pixel(x, z, self.w, self.h, self.bounds)
+                if not is_free_pixel_map(self.binary_map, u, v):
+                    continue
+            
+            return (x, z)
         return None
 
     @staticmethod
@@ -1560,6 +1630,56 @@ class RRTWorld:
             g_safe = (float(g3[0]), float(g3[2]))
         sx, sz = s_safe; gx, gz = g_safe
 
+        # 如果啟用地圖限制，檢查起點和終點是否在白色區域
+        if self.use_map_constraint:
+            # 檢查起點
+            s_px = world_to_pixel(sx, sz, self.w, self.h, self.bounds)
+            if not is_free_pixel_map(self.binary_map, s_px[0], s_px[1]):
+                print(f"[WARN] 起點 ({sx:.2f}, {sz:.2f}) 不在白色區域，嘗試尋找附近的白色區域點...")
+                # 在起點周圍搜索白色區域的點
+                found_white = False
+                for radius in [0.1, 0.2, 0.3, 0.5, 1.0]:
+                    for angle in np.linspace(0, 2*np.pi, 16):
+                        test_x = sx + radius * np.cos(angle)
+                        test_z = sz + radius * np.sin(angle)
+                        test_3d = np.array([test_x, 0.0, test_z], dtype=np.float32)
+                        test_snapped = self.sim.pathfinder.snap_point(test_3d)
+                        if self.sim.pathfinder.is_navigable(test_snapped):
+                            test_px = world_to_pixel(float(test_snapped[0]), float(test_snapped[2]), self.w, self.h, self.bounds)
+                            if is_free_pixel_map(self.binary_map, test_px[0], test_px[1]):
+                                sx, sz = float(test_snapped[0]), float(test_snapped[2])
+                                print(f"[INFO] 起點已修正為白色區域點: ({sx:.2f}, {sz:.2f})")
+                                found_white = True
+                                break
+                    if found_white:
+                        break
+                if not found_white:
+                    print("[WARN] 無法找到起點附近的白色區域點，將使用原起點（可能導致規劃失敗）")
+            
+            # 檢查終點
+            g_px = world_to_pixel(gx, gz, self.w, self.h, self.bounds)
+            if not is_free_pixel_map(self.binary_map, g_px[0], g_px[1]):
+                print(f"[WARN] 終點 ({gx:.2f}, {gz:.2f}) 不在白色區域，嘗試尋找附近的白色區域點...")
+                # 在終點周圍搜索白色區域的點
+                found_white = False
+                for radius in [0.1, 0.2, 0.3, 0.5, 1.0]:
+                    for angle in np.linspace(0, 2*np.pi, 16):
+                        test_x = gx + radius * np.cos(angle)
+                        test_z = gz + radius * np.sin(angle)
+                        test_3d = np.array([test_x, 0.0, test_z], dtype=np.float32)
+                        test_snapped = self.sim.pathfinder.snap_point(test_3d)
+                        if self.sim.pathfinder.is_navigable(test_snapped):
+                            test_px = world_to_pixel(float(test_snapped[0]), float(test_snapped[2]), self.w, self.h, self.bounds)
+                            if is_free_pixel_map(self.binary_map, test_px[0], test_px[1]):
+                                gx, gz = float(test_snapped[0]), float(test_snapped[2])
+                                print(f"[INFO] 終點已修正為白色區域點: ({gx:.2f}, {gz:.2f})")
+                                found_white = True
+                                break
+                    if found_white:
+                        break
+                if not found_white:
+                    print("[WARN] 無法找到終點附近的白色區域點，將使用原終點（可能導致規劃失敗）")
+
         # 連通性快檢：不同 island 直接回報（避免白跑 RRT）
         sp = habitat_sim.ShortestPath()
         sp.requested_start = np.array([sx, 0.0, sz], dtype=np.float32)
@@ -1579,7 +1699,7 @@ class RRTWorld:
         # 如果起點或終點在邊邊角角（使用 snap 後的點），增加容忍度
         is_start_corner = (s_safe[0] == float(s3[0]) and s_safe[1] == float(s3[2]))
         is_goal_corner = (g_safe[0] == float(g3[0]) and g_safe[1] == float(g3[2]))
-        max_no_improvement = 200 if (is_start_corner or is_goal_corner) else 5  # 最大無改進次數（早期終止）
+        max_no_improvement = 500
 
         for it in range(self.max_iter):
             # 早期終止：如果連續很多次沒有改進，提前結束（只在找到目標後才檢查）
@@ -1616,81 +1736,127 @@ class RRTWorld:
             # 邊檢查：帶 clearance 的掃掠測試
             # 如果起點或終點在邊邊角角，使用較小的 clearance
             effective_clearance = self.clearance_m * 0.1 if (is_start_corner or is_goal_corner) else self.clearance_m
-            if edge_collision_free_with_clearance(self.sim, qnear, qnew, effective_clearance, step_m=self.step_m*0.5):
-                # snap 一下更穩
-                qnew = snap(self.sim, *qnew)
-                # 新節點也要有 clearance（在邊邊角角時放寬）
-                if not point_has_clearance(self.sim, qnew[0], qnew[1], effective_clearance, dirs=4):
+            
+            # 檢查 NavMesh 邊碰撞
+            if not edge_collision_free_with_clearance(self.sim, qnear, qnew, effective_clearance, step_m=self.step_m*0.5):
+                continue
+            
+            # 如果啟用地圖限制，檢查邊是否穿過地圖上的障礙物
+            if self.use_map_constraint:
+                p1_px = world_to_pixel(qnear[0], qnear[1], self.w, self.h, self.bounds)
+                p2_px = world_to_pixel(qnew[0], qnew[1], self.w, self.h, self.bounds)
+                if not line_collision_free_map(self.binary_map, p1_px, p2_px, step_px=2.0):
                     continue
+            
+            # snap 一下更穩
+            qnew = snap(self.sim, *qnew)
+            
+            # 新節點也要有 clearance（在邊邊角角時放寬）
+            if not point_has_clearance(self.sim, qnew[0], qnew[1], effective_clearance, dirs=4):
+                continue
+            
+            # 如果啟用地圖限制，檢查新節點是否在地圖的白色區域
+            if self.use_map_constraint:
+                u, v = world_to_pixel(qnew[0], qnew[1], self.w, self.h, self.bounds)
+                if not is_free_pixel_map(self.binary_map, u, v):
+                    continue
+            
+            new_node_idx = len(self.nodes)
+            self.nodes.append(qnew)
+            
+            if self.use_rrt_star:
+                # 預先計算新節點的安全距離（避免重複計算）
+                new_node_d_safe = self._get_cached_distance(qnew[0], qnew[1])
                 
-                new_node_idx = len(self.nodes)
-                self.nodes.append(qnew)
+                # === RRT*: Choose Parent ===
+                # 計算初始成本（使用 nearest_node 作為 parent）
+                best_parent_idx = idx
+                best_cost = self.costs[idx] + self._calculate_edge_cost(qnear, qnew, (gx, gz), cached_dist=new_node_d_safe)
                 
-                if self.use_rrt_star:
-                    # 預先計算新節點的安全距離（避免重複計算）
-                    new_node_d_safe = self._get_cached_distance(qnew[0], qnew[1])
-                    
-                    # === RRT*: Choose Parent ===
-                    # 計算初始成本（使用 nearest_node 作為 parent）
-                    best_parent_idx = idx
-                    best_cost = self.costs[idx] + self._calculate_edge_cost(qnear, qnew, (gx, gz), cached_dist=new_node_d_safe)
-                    
-                    # 在鄰居中找到成本最低的 parent
-                    neighbors = self._get_neighbors(new_node_idx, radius=2.0 * self.step_m)
-                    for nb_idx in neighbors:
-                        nb_xy = self.nodes[nb_idx]
-                        # 檢查邊是否無碰撞（在邊邊角角時使用較小的 clearance）
-                        if edge_collision_free_with_clearance(self.sim, nb_xy, qnew, effective_clearance, step_m=self.step_m*0.5):
-                            # 使用緩存的距離
-                            cand_cost = self.costs[nb_idx] + self._calculate_edge_cost(nb_xy, qnew, (gx, gz), cached_dist=new_node_d_safe)
-                            if cand_cost < best_cost:
-                                best_parent_idx = nb_idx
-                                best_cost = cand_cost
-                    
-                    self.parent[new_node_idx] = best_parent_idx
-                    self.costs[new_node_idx] = best_cost
-                    
-                    # === RRT*: Rewire（限制數量以提升性能）===
-                    # 嘗試重連線鄰居以優化路徑
-                    rewire_count = 0
-                    max_rewire = 10  # 限制重連線數量
-                    for nb_idx in neighbors:
-                        if nb_idx == best_parent_idx or rewire_count >= max_rewire:
-                            continue
-                        nb_xy = self.nodes[nb_idx]
-                        # 檢查是否可以通過新節點優化鄰居的路徑（在邊邊角角時使用較小的 clearance）
-                        if edge_collision_free_with_clearance(self.sim, qnew, nb_xy, effective_clearance, step_m=self.step_m*0.5):
-                            new_cost = best_cost + self._calculate_edge_cost(qnew, nb_xy, (gx, gz))
-                            if new_cost < self.costs[nb_idx]:
-                                self.parent[nb_idx] = new_node_idx
-                                self.costs[nb_idx] = new_cost
-                                rewire_count += 1
-                else:
-                    # 原始 RRT：直接使用 nearest_node 作為 parent
-                    self.parent[new_node_idx] = idx
-                    self.costs[new_node_idx] = self.costs[idx] + self._calculate_edge_cost(qnear, qnew, (gx, gz))
+                # 在鄰居中找到成本最低的 parent
+                neighbors = self._get_neighbors(new_node_idx, radius=2.0 * self.step_m)
+                for nb_idx in neighbors:
+                    nb_xy = self.nodes[nb_idx]
+                    # 檢查邊是否無碰撞（在邊邊角角時使用較小的 clearance）
+                    navmesh_ok = edge_collision_free_with_clearance(self.sim, nb_xy, qnew, effective_clearance, step_m=self.step_m*0.5)
+                    if not navmesh_ok:
+                        continue
+                    # 如果啟用地圖限制，檢查邊是否穿過地圖上的障礙物
+                    map_ok = True
+                    if self.use_map_constraint:
+                        p1_px = world_to_pixel(nb_xy[0], nb_xy[1], self.w, self.h, self.bounds)
+                        p2_px = world_to_pixel(qnew[0], qnew[1], self.w, self.h, self.bounds)
+                        map_ok = line_collision_free_map(self.binary_map, p1_px, p2_px, step_px=2.0)
+                    if not map_ok:
+                        continue
+                    # 使用緩存的距離
+                    cand_cost = self.costs[nb_idx] + self._calculate_edge_cost(nb_xy, qnew, (gx, gz), cached_dist=new_node_d_safe)
+                    if cand_cost < best_cost:
+                        best_parent_idx = nb_idx
+                        best_cost = cand_cost
+                
+                self.parent[new_node_idx] = best_parent_idx
+                self.costs[new_node_idx] = best_cost
+                
+                # === RRT*: Rewire（限制數量以提升性能）===
+                # 嘗試重連線鄰居以優化路徑
+                rewire_count = 0
+                max_rewire = 10  # 限制重連線數量
+                for nb_idx in neighbors:
+                    if nb_idx == best_parent_idx or rewire_count >= max_rewire:
+                        continue
+                    nb_xy = self.nodes[nb_idx]
+                    # 檢查是否可以通過新節點優化鄰居的路徑（在邊邊角角時使用較小的 clearance）
+                    navmesh_ok = edge_collision_free_with_clearance(self.sim, qnew, nb_xy, effective_clearance, step_m=self.step_m*0.5)
+                    if not navmesh_ok:
+                        continue
+                    # 如果啟用地圖限制，檢查邊是否穿過地圖上的障礙物
+                    map_ok = True
+                    if self.use_map_constraint:
+                        p1_px = world_to_pixel(qnew[0], qnew[1], self.w, self.h, self.bounds)
+                        p2_px = world_to_pixel(nb_xy[0], nb_xy[1], self.w, self.h, self.bounds)
+                        map_ok = line_collision_free_map(self.binary_map, p1_px, p2_px, step_px=2.0)
+                    if navmesh_ok and map_ok:
+                        new_cost = best_cost + self._calculate_edge_cost(qnew, nb_xy, (gx, gz))
+                        if new_cost < self.costs[nb_idx]:
+                            self.parent[nb_idx] = new_node_idx
+                            self.costs[nb_idx] = new_cost
+                            rewire_count += 1
+            else:
+                # 原始 RRT：直接使用 nearest_node 作為 parent
+                self.parent[new_node_idx] = idx
+                self.costs[new_node_idx] = self.costs[idx] + self._calculate_edge_cost(qnear, qnew, (gx, gz))
 
-                # 是否到目標
-                if math.hypot(qnew[0]-gx, qnew[1]-gz) <= goal_thresh_m:
-                    # 追加一段到 goal（如需，在邊邊角角時使用較小的 clearance）
-                    if edge_collision_free_with_clearance(self.sim, qnew, (gx, gz), effective_clearance, step_m=self.step_m*0.5):
-                        goal_node_idx = len(self.nodes)
-                        self.nodes.append((gx, gz))
+            # 是否到目標
+            if math.hypot(qnew[0]-gx, qnew[1]-gz) <= goal_thresh_m:
+                # 追加一段到 goal（如需，在邊邊角角時使用較小的 clearance）
+                navmesh_ok = edge_collision_free_with_clearance(self.sim, qnew, (gx, gz), effective_clearance, step_m=self.step_m*0.5)
+                if not navmesh_ok:
+                    continue
+                # 如果啟用地圖限制，檢查邊是否穿過地圖上的障礙物
+                map_ok = True
+                if self.use_map_constraint:
+                    p1_px = world_to_pixel(qnew[0], qnew[1], self.w, self.h, self.bounds)
+                    p2_px = world_to_pixel(gx, gz, self.w, self.h, self.bounds)
+                    map_ok = line_collision_free_map(self.binary_map, p1_px, p2_px, step_px=2.0)
+                if navmesh_ok and map_ok:
+                    goal_node_idx = len(self.nodes)
+                    self.nodes.append((gx, gz))
+                    
+                    if self.use_rrt_star:
+                        # 計算到目標的成本
+                        goal_cost = self.costs[new_node_idx] + self._calculate_edge_cost(qnew, (gx, gz), (gx, gz))
+                        self.parent[goal_node_idx] = new_node_idx
+                        self.costs[goal_node_idx] = goal_cost
                         
-                        if self.use_rrt_star:
-                            # 計算到目標的成本
-                            goal_cost = self.costs[new_node_idx] + self._calculate_edge_cost(qnew, (gx, gz), (gx, gz))
-                            self.parent[goal_node_idx] = new_node_idx
-                            self.costs[goal_node_idx] = goal_cost
-                            
-                            if goal_cost < best_goal_cost:
-                                best_goal_node = goal_node_idx
-                                best_goal_cost = goal_cost
-                                consecutive_no_improvement = 0  # 重置計數器
-                        else:
-                            self.parent[goal_node_idx] = new_node_idx
-                            self.costs[goal_node_idx] = self.costs[new_node_idx] + self._calculate_edge_cost(qnew, (gx, gz), (gx, gz))
-                            return self._reconstruct_path(goal_node_idx)
+                        if goal_cost < best_goal_cost:
+                            best_goal_node = goal_node_idx
+                            best_goal_cost = goal_cost
+                            consecutive_no_improvement = 0  # 重置計數器
+                    else:
+                        self.parent[goal_node_idx] = new_node_idx
+                        self.costs[goal_node_idx] = self.costs[new_node_idx] + self._calculate_edge_cost(qnew, (gx, gz), (gx, gz))
+                        return self._reconstruct_path(goal_node_idx)
 
         # RRT* 返回最佳目標節點的路徑
         if self.use_rrt_star and best_goal_node is not None:
@@ -1838,6 +2004,12 @@ if __name__ == "__main__":
     navmesh_path = os.path.join(currdir, "replica_v1/apartment_0/habitat/mesh_semantic.navmesh")
     loaded = env.sim.pathfinder.load_nav_mesh(navmesh_path)
     print("[NAVMESH] loaded:", loaded)
+    
+    # === 創建二值化地圖（限制規劃在白色區域） ===
+    map_img_gray = cv2.cvtColor(map_img, cv2.COLOR_BGR2GRAY) if len(map_img.shape) == 3 else map_img
+    _, binary_map = cv2.threshold(map_img_gray, 240, 255, cv2.THRESH_BINARY)
+    print("[INFO] 已創建二值化地圖，限制 RRT 規劃在白色可行走區域")
+    
     # === 世界座標 RRT 規劃（帶安全距離） ===
     SAFE_CLEARANCE_M = 0.1   # 你想離牆/家具的距離（m）
     RRT_STEP_M       = 0.05   # RRT 延伸步長（m）
@@ -1850,12 +2022,17 @@ if __name__ == "__main__":
         goal_sample_rate=GOAL_BIAS,
         max_iter=12000,
         clearance_m=SAFE_CLEARANCE_M,
-        node_retry=200,
+        node_retry=500,
         # RRT* 參數（預設啟用）
-        min_safe_dist=0.02,              # 最小安全距離（米）
+        min_safe_dist=0.1,              # 最小安全距離（米）
         safe_weight=100.0,             # 安全懲罰權重
         goal_safety_exempt_dist=1.0,    # 接近目標時放寬安全距離（米）
-        use_rrt_star=True               # 啟用 RRT* 機制
+        use_rrt_star=True,              # 啟用 RRT* 機制
+        # 地圖限制參數（限制規劃在白色區域）
+        binary_map=binary_map,          # 二值化地圖（255=free, 0=obs）
+        bounds=bounds,                  # 地圖邊界
+        w=w,                            # 地圖寬度（像素）
+        h=h                             # 地圖高度（像素）
     )
 
     print(f"[PLAN] start_world={start_world}, goal_world={goal_world}")
