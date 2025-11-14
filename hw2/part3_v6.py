@@ -941,7 +941,8 @@ def navigate_simple_turn_move(
             desired_yaw = get_desired_yaw(current_pos_xz, (goalx, goalz))
             dyaw = wrap_to_pi(desired_yaw - current_yaw)
             
-            # print(f"[nav] pos=({pos[0]:.2f},{pos[2]:.2f}) -> final_goal=({goalx:.2f},{goalz:.2f}). dist={final_dist:.2f}, dyaw={math.degrees(dyaw):.1f}°")
+            # 啟用調試輸出，顯示最終目標導航狀態
+            print(f"[nav] pos=({pos[0]:.2f},{pos[2]:.2f}) -> final_goal=({goalx:.2f},{goalz:.2f}). dist={final_dist:.2f}, dyaw={math.degrees(dyaw):.1f}°")
             
             # 如果已經到達目標距離，進行精確轉向（類似 main.py 的做法）
             if final_dist <= dist_tol:
@@ -996,6 +997,14 @@ def navigate_simple_turn_move(
             if dist_to_target <= dist_tol:
                 # 情況 A: 已抵達航點
                 print(f"Reached waypoint {i}. Moving to next.")
+                # 如果這是最後一個 waypoint，檢查是否已接近最終目標
+                if i == N - 1:  # 最後一個 waypoint（索引從 0 開始，所以是 N-1）
+                    final_dist = math.hypot(pos[0] - goalx, pos[2] - goalz)
+                    if final_dist < 0.9:
+                        print(f"Final goal is close (dist={final_dist:.2f}m < 0.9m). Completing navigation...")
+                        face_goal(video_writer, env, goal_world, target_mask_func, fast_mode=fast_mode, display_interval=1)
+                        print("[DONE] Arrived goal.")
+                        return
                 i += 1
                 continue  # 繼續下一個循環，檢查是否到達最終目標
             
@@ -1009,13 +1018,26 @@ def navigate_simple_turn_move(
         
         # 執行動作
         if action_to_take:
+            # 在執行動作前，保存當前目標資訊（用於卡住檢測）
+            if i >= N:
+                current_target_xz = (goalx, goalz)
+            else:
+                current_target_xz = path[i]
+            
             obs = navigateAndSee(env, action_to_take, target_mask_func, video_writer, display_interval=display_interval)
             actions += 1
             
-            # 碰撞檢測：檢查是否卡住
+            # 碰撞檢測：檢查是否卡住（但在接近目標時禁用）
             if action_to_take == "move_forward":
                 new_pos = env.agent.get_state().position
-                if np.linalg.norm(new_pos - pos) < 1e-4:
+                # 計算到當前目標的距離
+                dist_to_current_target = math.hypot(
+                    new_pos[0] - current_target_xz[0], 
+                    new_pos[2] - current_target_xz[1]
+                )
+                
+                # 只有在距離目標 > 0.9m 時才檢查卡住（接近目標時可能是樓梯或精確對準）
+                if dist_to_current_target > 0.9 and np.linalg.norm(new_pos - pos) < 1e-4:
                     print("[WARN] No progress, possibly stuck. Trying to turn...")
                     obs = navigateAndSee(env, "turn_right", target_mask_func, video_writer, display_interval=display_interval)
                     obs = navigateAndSee(env, "turn_right", target_mask_func, video_writer, display_interval=display_interval)
@@ -2020,7 +2042,7 @@ if __name__ == "__main__":
         env.sim,
         step_m=RRT_STEP_M,
         goal_sample_rate=GOAL_BIAS,
-        max_iter=12000,
+        max_iter=20000,
         clearance_m=SAFE_CLEARANCE_M,
         node_retry=500,
         # RRT* 參數（預設啟用）

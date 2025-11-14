@@ -356,9 +356,9 @@ def is_safe_point(map_img, x, y, r=5):
     return True
 
 def find_all_object_instances(map_path, color_map, target_class, 
-                              min_area=100,  # 最小面積過濾（像素）
-                              check_navigable=False,  # 是否檢查可達性
-                              sim=None, bounds=None, w=None, h=None):  # 用於可達性檢查
+                              min_area=100, 
+                              check_navigable=False,  
+                              sim=None, bounds=None, w=None, h=None): 
     """
     (改進版)
     在語意地圖中尋找一個類別的所有獨立實例 (instances)。
