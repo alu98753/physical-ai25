@@ -1279,20 +1279,69 @@ def find_nearest_safe_world_point(sim, x, z, clearance_m, rmax=1.2, dr=0.05, dir
         R += dr
     return None
 
+# ========== RRT* 輔助函數 ==========
+def get_distance_to_obstacle(sim, x, z, max_search_radius=2.0):
+    """計算點到最近障礙物的距離（使用 Habitat-Sim API）"""
+    pt = np.array([x, 0.0, z], dtype=np.float32)
+    pt = sim.pathfinder.snap_point(pt)  # 先 snap 到 NavMesh
+    dist = sim.pathfinder.distance_to_closest_obstacle(pt, max_search_radius)
+    return float(dist)
 
-# ---------- RRT（世界座標版；可改 RRT* 但先給易用版） ----------
+def get_safety_penalty_world(sim, point_xy, goal_xy, min_safe_dist, safe_weight, goal_safety_exempt_dist, cached_dist=None):
+    """計算世界座標點的安全懲罰項（支援緩存距離）"""
+    x, z = point_xy
+    gx, gz = goal_xy
+    
+    # 使用緩存的距離或重新計算
+    if cached_dist is None:
+        d_safe = get_distance_to_obstacle(sim, x, z, max_search_radius=2.0)
+    else:
+        d_safe = cached_dist
+    
+    # 計算到目標的距離
+    dist_to_goal = math.hypot(x - gx, z - gz)
+    
+    # 僅在離目標一定距離外計算懲罰
+    safety_penalty = 0.0
+    if dist_to_goal > goal_safety_exempt_dist:
+        # 統一使用倒數平方懲罰：d_safe 越小，懲罰越大
+        if d_safe < min_safe_dist:
+            safety_penalty = safe_weight / ((d_safe + 1e-3) ** 2)
+        else:
+            # 即使安全，也給予輕微懲罰以鼓勵遠離牆壁
+            safety_penalty = safe_weight / ((d_safe + 1e-3) ** 2) * 0.1
+    
+    return safety_penalty, d_safe
+
+
+# ---------- RRT（世界座標版；支援 RRT*，預設啟用） ----------
 class RRTWorld:
     def __init__(self, sim, step_m=0.25, goal_sample_rate=0.15,
-                 max_iter=8000, clearance_m=0.25, node_retry=100):
+                 max_iter=8000, clearance_m=0.25, node_retry=100,
+                 # RRT* 參數
+                 min_safe_dist=0.1,  # 最小安全距離（米）
+                 safe_weight=1000.0,  # 安全懲罰權重
+                 goal_safety_exempt_dist=1.0,  # 接近目標時放寬安全距離（米）
+                 use_rrt_star=True,  # 是否使用 RRT* 機制
+                 max_neighbors=50):  # 限制鄰居搜索數量（性能優化）
         self.sim = sim
         self.step_m = step_m
         self.goal_rate = goal_sample_rate
         self.max_iter = max_iter
         self.clearance_m = clearance_m
         self.node_retry = node_retry
+        
+        # RRT* 參數
+        self.min_safe_dist = min_safe_dist
+        self.safe_weight = safe_weight
+        self.goal_safety_exempt_dist = goal_safety_exempt_dist
+        self.use_rrt_star = use_rrt_star
+        self.max_neighbors = max_neighbors
 
         self.nodes = []       # [(x,z)]
         self.parent = {}      # child_idx -> parent_idx
+        self.costs = {}       # node_idx -> cost (RRT* 需要)
+        self.distance_cache = {}  # 緩存距離查詢結果
 
     def _sample_free_with_clearance(self, bounds=None):
         # 簡單策略：從 navmesh 取隨機點，直到通過 clearance 檢查
@@ -1322,6 +1371,57 @@ class RRTWorld:
         r = self.step_m / dist
         return (fx + dx*r, fz + dz*r)
 
+    def _get_cached_distance(self, x, z):
+        """獲取緩存的距離或重新計算"""
+        key = (round(x, 3), round(z, 3))  # 四捨五入以減少緩存大小
+        if key not in self.distance_cache:
+            self.distance_cache[key] = get_distance_to_obstacle(self.sim, x, z, max_search_radius=2.0)
+        return self.distance_cache[key]
+
+    def _calculate_edge_cost(self, from_xy, to_xy, goal_xy, cached_dist=None):
+        """計算邊的成本（幾何距離 + 安全懲罰）"""
+        geometric_cost = math.hypot(to_xy[0] - from_xy[0], to_xy[1] - from_xy[1])
+        
+        if self.use_rrt_star:
+            safety_penalty, _ = get_safety_penalty_world(
+                self.sim, to_xy, goal_xy,
+                self.min_safe_dist, self.safe_weight, self.goal_safety_exempt_dist,
+                cached_dist=cached_dist
+            )
+            return geometric_cost + safety_penalty
+        else:
+            return geometric_cost
+
+    def _get_neighbors(self, node_idx, radius):
+        """獲取指定節點半徑內的鄰居（用於 RRT*，優化版）"""
+        if not self.use_rrt_star:
+            return []
+        
+        x, z = self.nodes[node_idx]
+        n = len(self.nodes)
+        
+        # 計算搜索半徑（類似 RRT* 的公式）
+        if n > 1:
+            # 使用對數縮放
+            search_radius = radius * math.sqrt(max(math.log(n) / n, 1e-9))
+        else:
+            search_radius = radius
+        
+        # 優化：只檢查距離最近的 max_neighbors 個節點
+        candidates = []
+        for i, (nx, nz) in enumerate(self.nodes):
+            if i == node_idx:
+                continue
+            dist = math.hypot(nx - x, nz - z)
+            if dist <= search_radius:
+                candidates.append((i, dist))
+        
+        # 按距離排序，只取最近的 max_neighbors 個
+        candidates.sort(key=lambda x: x[1])
+        neighbors = [idx for idx, _ in candidates[:self.max_neighbors]]
+        
+        return neighbors
+
     def plan(self, start_xy, goal_xy, goal_thresh_m=0.30):
         # 起終點 snap
         s3 = self.sim.pathfinder.snap_point(np.array([start_xy[0], 0.0, start_xy[1]], dtype=np.float32))
@@ -1347,8 +1447,22 @@ class RRTWorld:
 
         self.nodes = [(sx, sz)]
         self.parent = {}
+        self.costs = {0: 0.0}  # 起點成本為 0
+        self.distance_cache = {}  # 清空緩存
+        best_goal_node = None
+        best_goal_cost = float('inf')
+        consecutive_no_improvement = 0  # 連續無改進次數
+        max_no_improvement = 5  # 最大無改進次數（早期終止）
 
         for it in range(self.max_iter):
+            # 早期終止：如果連續很多次沒有改進，提前結束（只在找到目標後才檢查）
+            if self.use_rrt_star and best_goal_node is not None:
+                if consecutive_no_improvement >= max_no_improvement:
+                    print(f"[RRT*] 早期終止：連續 {max_no_improvement} 次無改進，已找到路徑")
+                    break
+                # 計數器在每次迭代結束時增加（如果已找到目標）
+                consecutive_no_improvement += 1
+            
             # 目標偏置取樣
             if random.random() < self.goal_rate:
                 qrand = (gx, gz)
@@ -1362,6 +1476,16 @@ class RRTWorld:
             qnear = self.nodes[idx]
             qnew  = self._steer(qnear, qrand)
 
+            # 檢查新節點的安全距離（類似 rrt_star.py 的邏輯，使用緩存）
+            if self.use_rrt_star:
+                dist_to_goal = math.hypot(qnew[0] - gx, qnew[1] - gz)
+                d_safe = self._get_cached_distance(qnew[0], qnew[1])
+                
+                # 僅在離目標一定距離外才強制執行絕對安全距離
+                if dist_to_goal > self.goal_safety_exempt_dist:
+                    if d_safe < self.min_safe_dist:
+                        continue  # 跳過太靠近障礙物的點
+
             # 邊檢查：帶 clearance 的掃掠測試
             if edge_collision_free_with_clearance(self.sim, qnear, qnew, self.clearance_m, step_m=self.step_m*0.5):
                 # snap 一下更穩
@@ -1369,17 +1493,80 @@ class RRTWorld:
                 # 新節點也要有 clearance
                 if not point_has_clearance(self.sim, qnew[0], qnew[1], self.clearance_m, dirs=4):
                     continue
+                
+                new_node_idx = len(self.nodes)
                 self.nodes.append(qnew)
-                self.parent[len(self.nodes)-1] = idx
+                
+                if self.use_rrt_star:
+                    # 預先計算新節點的安全距離（避免重複計算）
+                    new_node_d_safe = self._get_cached_distance(qnew[0], qnew[1])
+                    
+                    # === RRT*: Choose Parent ===
+                    # 計算初始成本（使用 nearest_node 作為 parent）
+                    best_parent_idx = idx
+                    best_cost = self.costs[idx] + self._calculate_edge_cost(qnear, qnew, (gx, gz), cached_dist=new_node_d_safe)
+                    
+                    # 在鄰居中找到成本最低的 parent
+                    neighbors = self._get_neighbors(new_node_idx, radius=2.0 * self.step_m)
+                    for nb_idx in neighbors:
+                        nb_xy = self.nodes[nb_idx]
+                        # 檢查邊是否無碰撞
+                        if edge_collision_free_with_clearance(self.sim, nb_xy, qnew, self.clearance_m, step_m=self.step_m*0.5):
+                            # 使用緩存的距離
+                            cand_cost = self.costs[nb_idx] + self._calculate_edge_cost(nb_xy, qnew, (gx, gz), cached_dist=new_node_d_safe)
+                            if cand_cost < best_cost:
+                                best_parent_idx = nb_idx
+                                best_cost = cand_cost
+                    
+                    self.parent[new_node_idx] = best_parent_idx
+                    self.costs[new_node_idx] = best_cost
+                    
+                    # === RRT*: Rewire（限制數量以提升性能）===
+                    # 嘗試重連線鄰居以優化路徑
+                    rewire_count = 0
+                    max_rewire = 10  # 限制重連線數量
+                    for nb_idx in neighbors:
+                        if nb_idx == best_parent_idx or rewire_count >= max_rewire:
+                            continue
+                        nb_xy = self.nodes[nb_idx]
+                        # 檢查是否可以通過新節點優化鄰居的路徑
+                        if edge_collision_free_with_clearance(self.sim, qnew, nb_xy, self.clearance_m, step_m=self.step_m*0.5):
+                            new_cost = best_cost + self._calculate_edge_cost(qnew, nb_xy, (gx, gz))
+                            if new_cost < self.costs[nb_idx]:
+                                self.parent[nb_idx] = new_node_idx
+                                self.costs[nb_idx] = new_cost
+                                rewire_count += 1
+                else:
+                    # 原始 RRT：直接使用 nearest_node 作為 parent
+                    self.parent[new_node_idx] = idx
+                    self.costs[new_node_idx] = self.costs[idx] + self._calculate_edge_cost(qnear, qnew, (gx, gz))
 
                 # 是否到目標
                 if math.hypot(qnew[0]-gx, qnew[1]-gz) <= goal_thresh_m:
                     # 追加一段到 goal（如需）
                     if edge_collision_free_with_clearance(self.sim, qnew, (gx, gz), self.clearance_m, step_m=self.step_m*0.5):
+                        goal_node_idx = len(self.nodes)
                         self.nodes.append((gx, gz))
-                        self.parent[len(self.nodes)-1] = len(self.nodes)-2
-                    return self._reconstruct_path(len(self.nodes)-1)
+                        
+                        if self.use_rrt_star:
+                            # 計算到目標的成本
+                            goal_cost = self.costs[new_node_idx] + self._calculate_edge_cost(qnew, (gx, gz), (gx, gz))
+                            self.parent[goal_node_idx] = new_node_idx
+                            self.costs[goal_node_idx] = goal_cost
+                            
+                            if goal_cost < best_goal_cost:
+                                best_goal_node = goal_node_idx
+                                best_goal_cost = goal_cost
+                                consecutive_no_improvement = 0  # 重置計數器
+                        else:
+                            self.parent[goal_node_idx] = new_node_idx
+                            self.costs[goal_node_idx] = self.costs[new_node_idx] + self._calculate_edge_cost(qnew, (gx, gz), (gx, gz))
+                            return self._reconstruct_path(goal_node_idx)
 
+        # RRT* 返回最佳目標節點的路徑
+        if self.use_rrt_star and best_goal_node is not None:
+            return self._reconstruct_path(best_goal_node)
+        
         return None  # 失敗
 
     def _reconstruct_path(self, last_idx):
@@ -1482,7 +1669,14 @@ if __name__ == "__main__":
     if target_class not in available_classes:
         raise ValueError(f"⚠️ '{target_class}' 不在清單中。")
 
-    goals_list, goal_mask = find_all_object_instances(MAP_PATH, color_map, target_class)
+    # 調用 find_all_object_instances，啟用可達性檢查
+    # 注意：此時環境尚未初始化，所以先不檢查可達性
+    # 可達性檢查將在環境初始化後進行
+    goals_list, goal_mask = find_all_object_instances(
+        MAP_PATH, color_map, target_class,
+        min_area=100,  # 最小面積過濾
+        check_navigable=False  # 暫時不檢查，因為環境還沒初始化
+    )
     if not goals_list or goal_mask is None:
         raise ValueError(f"⚠️ 找不到目標類別 '{target_class}' 的任何區域。")
 
@@ -1526,18 +1720,73 @@ if __name__ == "__main__":
         goal_sample_rate=GOAL_BIAS,
         max_iter=12000,
         clearance_m=SAFE_CLEARANCE_M,
-        node_retry=200
+        node_retry=200,
+        # RRT* 參數（預設啟用）
+        min_safe_dist=0.1,              # 最小安全距離（米）
+        safe_weight=1000.0,             # 安全懲罰權重
+        goal_safety_exempt_dist=1.0,    # 接近目標時放寬安全距離（米）
+        use_rrt_star=True               # 啟用 RRT* 機制
     )
 
     print(f"[PLAN] start_world={start_world}, goal_world={goal_world}")
+    
+    # === 檢查並修正起點和終點的可達性 ===
+    print("[INFO] 檢查起點和終點的可達性...")
+    
+    # 修正起點
+    start_pos_3d = np.array([start_world[0], 0.0, start_world[1]], dtype=np.float32)
+    start_snapped = env.sim.pathfinder.snap_point(start_pos_3d)
+    if not env.sim.pathfinder.is_navigable(start_snapped):
+        print("[WARN] 起點不可達，尋找最近的可達點...")
+        start_safe = find_nearest_safe_world_point(env.sim, start_world[0], start_world[1], 
+                                                    SAFE_CLEARANCE_M, rmax=2.0)  # 擴大搜索半徑
+        if start_safe:
+            start_world = start_safe
+            print(f"[INFO] 起點已修正為: {start_world}")
+        else:
+            raise RuntimeError("起點附近找不到可達點，請重新選擇起點")
+    else:
+        # 即使可達，也檢查是否有足夠的安全距離
+        start_safe = find_nearest_safe_world_point(env.sim, start_world[0], start_world[1], 
+                                                    SAFE_CLEARANCE_M, rmax=0.5)  # 小範圍搜索
+        if start_safe:
+            start_world = start_safe
+    
+    # 修正終點
+    goal_pos_3d = np.array([goal_world[0], 0.0, goal_world[1]], dtype=np.float32)
+    goal_snapped = env.sim.pathfinder.snap_point(goal_pos_3d)
+    if not env.sim.pathfinder.is_navigable(goal_snapped):
+        print("[WARN] 終點不可達，尋找最近的可達點...")
+        goal_safe = find_nearest_safe_world_point(env.sim, goal_world[0], goal_world[1], 
+                                                   SAFE_CLEARANCE_M, rmax=2.0)  # 擴大搜索半徑
+        if goal_safe:
+            # 檢查修正後的點是否距離原始點太遠
+            dist = math.hypot(goal_safe[0] - goal_world[0], goal_safe[1] - goal_world[1])
+            if dist > 2.0:  # 如果距離超過 2 米，給出警告
+                print(f"[WARN] 終點修正距離較遠 ({dist:.2f}m)，可能目標在牆壁中")
+            goal_world = goal_safe
+            print(f"[INFO] 終點已修正為: {goal_world}")
+        else:
+            raise RuntimeError("終點附近找不到可達點，目標可能在牆壁中或不可達區域")
+    else:
+        # 即使可達，也檢查是否有足夠的安全距離
+        goal_safe = find_nearest_safe_world_point(env.sim, goal_world[0], goal_world[1], 
+                                                    SAFE_CLEARANCE_M, rmax=0.5)  # 小範圍搜索
+        if goal_safe:
+            goal_world = goal_safe
+    
+    # 驗證修正後的點
+    print("[DEBUG] start navigable:", env.sim.pathfinder.is_navigable(
+        np.array([start_world[0], 0.0, start_world[1]], dtype=np.float32)))
+    print("[DEBUG] goal navigable:", env.sim.pathfinder.is_navigable(
+        np.array([goal_world[0], 0.0, goal_world[1]], dtype=np.float32)))
+    
+    # 檢查連通性（使用 ShortestPath 快速檢查）
     path = habitat_sim.ShortestPath()
     path.requested_start = np.array([start_world[0], 0.0, start_world[1]], np.float32)
     path.requested_end   = np.array([goal_world[0], 0.0, goal_world[1]], np.float32)
     found = env.sim.pathfinder.find_path(path)
-    print("[DEBUG] path found:", found, " length:", path.geodesic_distance)
-
-    print("[DEBUG] start navigable:", env.sim.pathfinder.is_navigable(np.array([start_world[0], 0.0,start_world[1]], np.float32)))
-    print("[DEBUG] goal navigable:", env.sim.pathfinder.is_navigable(np.array([goal_world[0], 0.0, goal_world[1]], np.float32)))
+    print("[DEBUG] path found:", found, " length:", path.geodesic_distance if found else "N/A")
 
     path_world = rrt.plan(start_world, goal_world, goal_thresh_m=GOAL_THRESH_M)
     if path_world is None or len(path_world) < 2:

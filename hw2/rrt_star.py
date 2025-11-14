@@ -355,11 +355,19 @@ def is_safe_point(map_img, x, y, r=5):
                 return False
     return True
 
-def find_all_object_instances(map_path, color_map, target_class):
+def find_all_object_instances(map_path, color_map, target_class, 
+                              min_area=100,  # 最小面積過濾（像素）
+                              check_navigable=False,  # 是否檢查可達性
+                              sim=None, bounds=None, w=None, h=None):  # 用於可達性檢查
     """
-    (新函數)
+    (改進版)
     在語意地圖中尋找一個類別的所有獨立實例 (instances)。
     例如，找到地圖上 3 個不同的 'window'。
+    
+    改進：
+    1. 過濾小面積區域（去除雜訊）
+    2. 檢查中心點是否可達（避免在房間外部或不同 component）
+    3. 如果中心點不可達，在連通區域內找最近的可達點
 
     返回：
         list[tuple(int, int)]: 一個包含所有實例中心點 (x, y) 座標的清單。
@@ -390,8 +398,17 @@ def find_all_object_instances(map_path, color_map, target_class):
     # 用形態學「閉運算」(Closing) 來合併鄰近的區域
     # ==========================================================
     
-    # (1) 定義一個 "核" (Kernel) 決定了要合併多近的物體 如果窗戶還是太多，請嘗試「加大」這個值 (e.g., 25, 25)
-    merge_kernel_size = (300, 300) 
+    # (1) 定義一個 "核" (Kernel) 決定了要合併多近的物體
+    #     根據物體類別調整 kernel 大小，避免跨房間合併
+    KERNEL_SIZES = {
+        'sofa': (150, 150),      # 較小的 kernel，避免跨房間
+        'stair': (200, 200),     # 樓梯可能較長
+        'table': (100, 100),     # 桌子通常較小
+        'bed': (200, 200),       # 床可能較大
+        'window': (300, 300),    # 窗戶可以較大
+        'door': (150, 150),      # 門通常較小
+    }
+    merge_kernel_size = KERNEL_SIZES.get(target_class, (300, 300))
     kernel = cv2.getStructuringElement(cv2.MORPH_RECT, merge_kernel_size)
     
     # (2) 執行閉運算 (Dilation -> Erosion)
@@ -404,14 +421,76 @@ def find_all_object_instances(map_path, color_map, target_class):
     num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(mask, 8, cv2.CV_32S)
 
     goals_list = []
+    skipped_small = 0
+    skipped_unreachable = 0
     
     # 4. 迭代所有找到的標籤 (跳過 0，因為 0 是 background)
     for i in range(1, num_labels):
-        # 獲取標籤 i (例如 窗戶A) 的中心點
-        center = tuple(map(int, centroids[i]))
-        goals_list.append(center)
+        area = stats[i, cv2.CC_STAT_AREA]
         
-    print(f"[INFO] 找到 {len(goals_list)} 個 '{target_class}' 實例 (已合併鄰近區域)。")
+        # 過濾 1: 面積太小可能是雜訊
+        if area < min_area:
+            skipped_small += 1
+            continue
+        
+        # 獲取中心點
+        center = tuple(map(int, centroids[i]))
+        
+        # 過濾 2: 檢查中心點是否可達（如果啟用）
+        if check_navigable and sim is not None and bounds is not None and w is not None and h is not None:
+            # 將像素座標轉換為世界座標
+            # 使用與 part3_v6.py 相同的轉換邏輯
+            def pixel_to_world_local(u, v, w_img, h_img, bounds_dict):
+                SCALE_FACTOR = 10000 / 255
+                xmin_pt, xmax_pt, zmin_pt, zmax_pt = bounds_dict["xmin"], bounds_dict["xmax"], bounds_dict["zmin"], bounds_dict["zmax"]
+                x_pt = xmin_pt + (u / w_img) * (xmax_pt - xmin_pt)
+                z_pt = zmin_pt + (1.0 - (v / h_img)) * (zmax_pt - zmin_pt)
+                x_world = x_pt * SCALE_FACTOR
+                z_world = z_pt * SCALE_FACTOR
+                return float(x_world), float(z_world)
+            
+            center_world = pixel_to_world_local(center[0], center[1], w, h, bounds)
+            center_3d = np.array([center_world[0], 0.0, center_world[1]], dtype=np.float32)
+            
+            if not sim.pathfinder.is_navigable(center_3d):
+                # 中心點不可達，在連通區域內找可達點
+                component_mask = (labels == i).astype(np.uint8)
+                navigable_points = []
+                
+                # 在 component 內採樣點（避免檢查所有點，太慢）
+                ys, xs = np.where(component_mask > 0)
+                # 每隔 N 個點檢查一次（加速）
+                step = max(1, len(ys) // 100)  # 最多檢查 100 個點
+                for idx in range(0, len(ys), step):
+                    y, x = ys[idx], xs[idx]
+                    world_pos = pixel_to_world_local(x, y, w, h, bounds)
+                    pos_3d = np.array([world_pos[0], 0.0, world_pos[1]], dtype=np.float32)
+                    if sim.pathfinder.is_navigable(pos_3d):
+                        navigable_points.append((x, y))
+                
+                if navigable_points:
+                    # 找到可達點，使用最接近原始中心的點
+                    center_np = np.array(center)
+                    distances = [np.hypot(p[0] - center_np[0], p[1] - center_np[1]) for p in navigable_points]
+                    best_idx = np.argmin(distances)
+                    center = navigable_points[best_idx]
+                    print(f"[INFO] 實例 {i}: 中心點不可達，使用最近的可達點 {center}")
+                else:
+                    # 找不到可達點，跳過這個實例
+                    skipped_unreachable += 1
+                    continue
+        
+        goals_list.append(center)
+    
+    # 打印統計信息
+    total_found = num_labels - 1
+    print(f"[INFO] 找到 {total_found} 個 '{target_class}' 連通區域:")
+    print(f"      - 有效實例: {len(goals_list)}")
+    if skipped_small > 0:
+        print(f"      - 跳過（面積 < {min_area}）: {skipped_small}")
+    if skipped_unreachable > 0:
+        print(f"      - 跳過（不可達）: {skipped_unreachable}")
+    
     return goals_list, original_mask
 
 
