@@ -1448,9 +1448,7 @@ if __name__ == "__main__":
 
     # 語意表 & 有哪些類別真實出現在地圖
     color_map = load_semantic_table(EXCEL_PATH)
-    print(f"[INFO] color_map: {color_map.keys()}")
-    
-    
+    # print(f"[INFO] color_map: {color_map.keys()}")
     id_map    = load_semantic_ID_table(EXCEL_PATH)
     unique_colors = np.unique(map_img.reshape(-1, 3), axis=0)
     unique_set    = {tuple(c.tolist()) for c in unique_colors}

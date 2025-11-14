@@ -57,13 +57,13 @@ class Projection(object):
         # 這裡我們不使用傳入的 theta, 而是用 spec 中指定的 pitch
         pitch = -np.pi / 2
         R_bev = np.array([[1, 0, 0],
-                          [0, np.cos(pitch), -np.sin(pitch)],
-                          [0, np.sin(pitch),  np.cos(pitch)]], dtype=np.float32)
+                        [0, np.cos(pitch), -np.sin(pitch)],
+                        [0, np.sin(pitch),  np.cos(pitch)]], dtype=np.float32)
         R_bev_inv = R_bev.T # 旋轉矩陣的逆等於轉置
 
         projected_points = []
         
-        # 2. 遍歷所有在BEV圖像上點擊的點
+        # 2. for 所有在BEV圖像上點擊的點變換座標
         for p_bev in self.points:
             u, v = p_bev
             p_bev_homogeneous = np.array([u, v, 1], dtype=np.float32)
