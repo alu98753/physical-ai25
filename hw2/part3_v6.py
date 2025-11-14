@@ -106,6 +106,7 @@ class HabitatEnvWrapper:
             "depth": obs["depth"],
             "foot_depth": obs["foot_depth"],
             "semantic": self._decode_semantic(obs["semantic_sensor"]),
+            "semantic_raw": obs["semantic_sensor"],  # 新增：原始語義 ID 數據，用於精確匹配
         }
 
     @staticmethod
@@ -142,11 +143,98 @@ def hex_to_rgb(hex_color):
     return tuple(int(hex_color[i:i+2], 16) for i in (0, 2, 4))
 
 def target_mask(obs):
-    semantic_img = obs["semantic"]
+    """
+    使用原始的語義 ID 數據來匹配目標，而不是從 RGB 影像中匹配顏色。
+    這樣更準確，不會誤匹配其他物件。
+    注意：這個函數匹配所有相同語意類別的物件。
+    """
+    # 使用原始的語義 ID 數據，而不是 RGB 影像
+    semantic_raw = obs["semantic_raw"]  # 原始語義 ID 陣列
     target_id = id_map[target_class.lower()] % 40
-    target_rgb = hex_to_rgb(d3_40_colors_hex[target_id])
-    mask = cv2.inRange(semantic_img, target_rgb, target_rgb)
-    return (mask > 0).astype(np.uint8)
+    
+    # 直接匹配語義 ID（取模 40，因為 d3_40_colors 只有 40 種顏色）
+    mask = (semantic_raw % 40 == target_id).astype(np.uint8)
+    return mask
+
+def find_target_object_id(env, goal_world, target_class):
+    """
+    從目標世界座標找到最近的物件，並返回其物件 ID。
+    這樣可以只匹配特定的物件實例，而不是所有相同語意類別的物件。
+    """
+    scene = env.sim.semantic_scene
+    if not scene or not scene.objects:
+        print("[WARN] Semantic scene or objects not available")
+        return None
+    
+    # 獲取目標類別的語意 ID
+    target_category_id = id_map[target_class.lower()] % 40
+    
+    # 找到所有符合目標類別的物件
+    candidate_objects = []
+    for obj in scene.objects:
+        if obj and obj.category:
+            # 檢查是否為目標類別（通過 semantic_id 或 category）
+            obj_semantic_id = None
+            if hasattr(obj, 'semantic_id'):
+                obj_semantic_id = obj.semantic_id % 40
+            elif hasattr(obj.category, 'index'):
+                obj_semantic_id = obj.category.index() % 40
+            
+            # 也可以通過 category name 來匹配
+            category_match = False
+            if hasattr(obj.category, 'name'):
+                cat_name = obj.category.name()
+                if callable(cat_name):
+                    cat_name = cat_name()
+                if isinstance(cat_name, bytes):
+                    cat_name = cat_name.decode('utf-8', errors='ignore')
+                if isinstance(cat_name, str) and cat_name.lower() == target_class.lower():
+                    category_match = True
+            
+            if obj_semantic_id == target_category_id or category_match:
+                # 計算物件中心到目標點的距離
+                obj_center = None
+                if hasattr(obj, 'aabb') and obj.aabb:
+                    center = obj.aabb.center
+                    obj_center = (float(center[0]), float(center[2]))
+                elif hasattr(obj, 'center'):
+                    center = obj.center
+                    obj_center = (float(center[0]), float(center[2]))
+                
+                if obj_center:
+                    dist = math.hypot(obj_center[0] - goal_world[0], obj_center[1] - goal_world[1])
+                    candidate_objects.append((obj, dist))
+    
+    if not candidate_objects:
+        print(f"[WARN] No objects found for target class '{target_class}' near goal position")
+        return None
+    
+    # 找到最近的物件
+    closest_obj, min_dist = min(candidate_objects, key=lambda x: x[1])
+    
+    # 獲取物件 ID
+    obj_id = closest_obj.id
+    if isinstance(obj_id, str):
+        try:
+            obj_id = int(obj_id.lstrip('_'))
+        except ValueError:
+            print(f"[WARN] Could not convert object ID '{obj_id}' to int")
+            return None
+    
+    print(f"[INFO] Found target object ID: {obj_id} at distance {min_dist:.2f}m from goal")
+    return obj_id
+
+def create_target_mask_func(target_object_id):
+    """
+    創建一個只匹配特定物件 ID 的 target_mask 函數。
+    這樣可以只 mask 選定的物件實例，而不是所有相同語意類別的物件。
+    """
+    def target_mask_specific(obs):
+        semantic_raw = obs["semantic_raw"]
+        # 只匹配特定的物件 ID（不取模，因為要精確匹配物件實例）
+        mask = (semantic_raw == target_object_id).astype(np.uint8)
+        return mask
+    return target_mask_specific
 
 
 def navigateAndSee(env_instance, action, target_mask_func, video_writer=None):
@@ -321,6 +409,7 @@ def overlay_mask(rgb, mask, color=(255, 0, 0), alpha=0.15):
 def face_goal(video_writer,env, goal, bounds, w, h, target_mask, FPS=120, TURN_ANGLE=1):
     """
     抵達目標後, 旋轉朝向目標並結束錄影。
+    使用類似 main.py 的 while 循環進行精確轉向。
     """
     pos = env.agent.get_state().position.copy()
     print(f"[SUCCESS] Reached goal ✅ ({pos[0]:.2f}, {pos[2]:.2f})")
@@ -332,15 +421,26 @@ def face_goal(video_writer,env, goal, bounds, w, h, target_mask, FPS=120, TURN_A
     yaw_diff = wrap_to_pi(desired_yaw - current_yaw)
     print(f"[TURN] current_yaw={math.degrees(current_yaw):.1f}°, desired_yaw={math.degrees(desired_yaw):.1f}°, diff={math.degrees(yaw_diff):.1f}°")
     
-    turn_action = "turn_left" if yaw_diff < 0 else "turn_right"
-    turn_steps = int(abs(math.degrees(yaw_diff)) // TURN_ANGLE)
-    print(f"[INFO] Turning {turn_steps} steps to face goal...")
-
-    if turn_steps > 0:
-        for i in range(turn_steps):
-            obs = navigateAndSee(env, turn_action, target_mask,video_writer)
-    else:
-        obs = navigateAndSee(env, "turn_left", target_mask,video_writer)
+    # 使用 while 循環持續轉向直到對準（類似 main.py 的做法）
+    iter_count = 0
+    while abs(yaw_diff) > math.radians(0.5) and iter_count < 20:  # 持續轉向直到角度差 < 0.5 度
+        turn_action = "turn_left" if yaw_diff < 0 else "turn_right"
+        obs = navigateAndSee(env, turn_action, target_mask, video_writer)
+        
+        # 重新計算角度
+        q = env.agent.get_state().rotation
+        current_yaw = 2 * math.atan2(q.imag[1], q.real)
+        yaw_diff = wrap_to_pi(desired_yaw - current_yaw)
+        iter_count += 1
+        
+        if iter_count % 5 == 0:  # 每 5 次打印一次進度
+            print(f"[FACE_GOAL] iter={iter_count}, yaw_diff={math.degrees(yaw_diff):.1f}°")
+    
+    print(f"[FACE_GOAL] Finished turning after {iter_count} iterations. Final yaw_diff={math.degrees(yaw_diff):.1f}°")
+    
+    # 確保有最後一次觀測
+    if iter_count == 0:
+        obs = navigateAndSee(env, "turn_left", target_mask, video_writer)
 
     # ( ... 結尾動畫 ... )
     rgb = obs["rgb"].copy()
@@ -709,11 +809,6 @@ def navigate_simple_turn_move(
         
         # 檢查是否已到達最終目標（優先檢查）
         final_dist = math.hypot(pos[0] - goalx, pos[2] - goalz)
-        if final_dist <= dist_tol:
-            print(f"Final goal reached! Distance: {final_dist:.2f}m")
-            face_goal(video_writer, env, goal_pixel, bounds, w, h, target_mask_func)
-            print("[DONE] Arrived goal.")
-            return
         
         # 如果已抵達所有航點，朝向最終目標導航
         if i >= N:
@@ -723,6 +818,34 @@ def navigate_simple_turn_move(
             
             print(f"[nav] pos=({pos[0]:.2f},{pos[2]:.2f}) -> final_goal=({goalx:.2f},{goalz:.2f}). dist={final_dist:.2f}, dyaw={math.degrees(dyaw):.1f}°")
             
+            # 如果已經到達目標距離，進行精確轉向（類似 main.py 的做法）
+            if final_dist <= dist_tol:
+                # 持續轉向直到對準（類似 main.py 的做法）
+                print(f"Final goal reached! Distance: {final_dist:.2f}m. Aligning to goal...")
+                iter_count = 0
+                while abs(dyaw) > yaw_tol and iter_count < 20:  # 最多轉 20 次
+                    action_to_take = "turn_left" if dyaw > 0 else "turn_right"
+                    obs = navigateAndSee(env, action_to_take, target_mask_func, video_writer)
+                    actions += 1
+                    
+                    # 重新計算角度
+                    astate = env.agent.get_state()
+                    pos = astate.position.copy()
+                    current_pos_xz = (pos[0], pos[2])
+                    current_yaw = get_yaw_from_quat(astate.rotation)
+                    desired_yaw = get_desired_yaw(current_pos_xz, (goalx, goalz))
+                    dyaw = wrap_to_pi(desired_yaw - current_yaw)
+                    iter_count += 1
+                    
+                    if iter_count % 5 == 0:  # 每 5 次打印一次進度
+                        print(f"[ALIGN] iter={iter_count}, dyaw={math.degrees(dyaw):.1f}°")
+                
+                print("Final waypoint reached and aligned.")
+                face_goal(video_writer, env, goal_pixel, bounds, w, h, target_mask_func)
+                print("[DONE] Arrived goal.")
+                return
+            
+            # 如果還沒到達目標距離，繼續導航
             if abs(dyaw) > yaw_tol:
                 # 尚未對準最終目標，轉向
                 action_to_take = "turn_left" if dyaw > 0 else "turn_right"
@@ -1370,7 +1493,7 @@ if __name__ == "__main__":
     loaded = env.sim.pathfinder.load_nav_mesh(navmesh_path)
     print("[NAVMESH] loaded:", loaded)
     # === 世界座標 RRT 規劃（帶安全距離） ===
-    SAFE_CLEARANCE_M = 0.2   # 你想離牆/家具的距離（m）
+    SAFE_CLEARANCE_M = 0.1   # 你想離牆/家具的距離（m）
     RRT_STEP_M       = 0.05   # RRT 延伸步長（m）
     GOAL_BIAS        = 0.20   # 目標偏置機率
     GOAL_THRESH_M    = 0.50   # 視為到達 goal 的半徑（m）
@@ -1444,6 +1567,15 @@ if __name__ == "__main__":
         cosang = float(np.dot(fwd, to_next) / (np.linalg.norm(fwd)*np.linalg.norm(to_next)+1e-9))
         print(f"[CHECK] cos(angle to next waypoint) = {cosang:.3f}")
 
+    # === 找到目標物件 ID（只匹配選定的物件實例） ===
+    target_object_id = find_target_object_id(env, goal_world, target_class)
+    if target_object_id is not None:
+        print(f"[INFO] Using specific object mask for object ID: {target_object_id}")
+        target_mask_func = create_target_mask_func(target_object_id)
+    else:
+        print("[WARN] Could not find target object ID, falling back to category-based mask")
+        target_mask_func = target_mask  # 使用原本的函數（匹配所有相同類別的物件）
+
     # === 錄影器設定 ===
     fourcc = cv2.VideoWriter_fourcc(*'mp4v')
     video_path = os.path.join(OUTPUT_PATH, f"{target_class}_navigation.mp4")
@@ -1454,12 +1586,12 @@ if __name__ == "__main__":
     navigate_simple_turn_move(
         env,
         world_path=path_world,
-        target_mask_func=target_mask,  # 你的語義遮罩函式
+        target_mask_func=target_mask_func,  # 使用特定的物件遮罩函式
         goal_pixel=goal_px,            # face_goal 仍需像素座標
         bounds=bounds,
         w=w, h=h,
         video_writer=video_writer,
-        dist_tol=0.10,                 # 抵達航點的距離閾值（米）
+        dist_tol=0.05,                 # 抵達航點的距離閾值（米）
         yaw_tol_deg=4.0,               # 對準的角度容忍度（度）
         max_actions=MAX_ACTIONS
     )
