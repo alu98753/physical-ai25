@@ -287,6 +287,93 @@ def load_bounds(json_path):
         data = json.load(f)
     return data["xmin"], data["xmax"], data["zmin"], data["zmax"]
 
+def select_goal_connected(map_path, start_px, original_goal_px=None):
+    """
+    讓使用者在看到起點後，點選終點（用於連通性檢查失敗時的 fallback）。
+    使用 OpenCV 的點擊功能，比 matplotlib 更穩定。
+    
+    Args:
+        map_path: 地圖路徑
+        start_px: 起點像素座標 (x, y)
+        original_goal_px: 原始目標像素座標（可選，用於顯示）
+    
+    Returns:
+        (x, y) 像素座標
+    """
+    # 讀取地圖
+    img = cv2.imread(map_path)
+    if img is None:
+        raise FileNotFoundError(f"無法讀取地圖: {map_path}")
+    
+    h, w = img.shape[:2]
+    vis = img.copy()
+    
+    # 顯示起點（綠色圓圈）
+    cv2.circle(vis, start_px, 8, (0, 255, 0), -1)
+    cv2.circle(vis, start_px, 12, (0, 255, 0), 2)
+    cv2.putText(vis, "Start", (start_px[0] + 15, start_px[1] - 15),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+    
+    # 如果提供了原始目標，也顯示（紅色 X，標記為不可達）
+    if original_goal_px:
+        # 畫 X 標記
+        size = 10
+        cv2.line(vis, 
+                (original_goal_px[0] - size, original_goal_px[1] - size),
+                (original_goal_px[0] + size, original_goal_px[1] + size),
+                (0, 0, 255), 3)
+        cv2.line(vis,
+                (original_goal_px[0] - size, original_goal_px[1] + size),
+                (original_goal_px[0] + size, original_goal_px[1] - size),
+                (0, 0, 255), 3)
+        cv2.putText(vis, "Original Goal (Not Connected)", 
+                   (original_goal_px[0] + 15, original_goal_px[1] - 15),
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 2)
+    
+    # 使用 OpenCV 的點擊回調
+    class ClickState:
+        def __init__(self):
+            self.point = None
+            self.clicked = False
+    
+    state = ClickState()
+    window_name = "Select Goal (Left click to select, ENTER to confirm, ESC to cancel)"
+    
+    def on_mouse(event, x, y, flags, param):
+        if event == cv2.EVENT_LBUTTONDOWN:
+            state.point = (x, y)
+            state.clicked = True
+            # 在點擊位置畫一個紅色圓圈
+            vis_copy = vis.copy()
+            cv2.circle(vis_copy, (x, y), 8, (0, 0, 255), -1)
+            cv2.circle(vis_copy, (x, y), 12, (0, 0, 255), 2)
+            cv2.putText(vis_copy, f"Selected: ({x}, {y})", (x + 15, y - 15),
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 2)
+            cv2.imshow(window_name, vis_copy)
+    
+    cv2.namedWindow(window_name, cv2.WINDOW_AUTOSIZE)
+    cv2.setMouseCallback(window_name, on_mouse)
+    
+    print("[INFO] 請在地圖視窗中點選一個與起點連通的終點")
+    print("       左鍵點擊選擇，按 ENTER 確認，按 ESC 取消")
+    
+    while True:
+        cv2.imshow(window_name, vis)
+        k = cv2.waitKey(16) & 0xFF
+        
+        if k in (13, 10):  # Enter
+            if state.point is not None:
+                break
+            else:
+                print("[WARN] 請先點選一個點")
+        elif k == 27:  # Esc
+            print("[INFO] 用戶取消選擇")
+            cv2.destroyWindow(window_name)
+            return None
+    
+    cv2.destroyWindow(window_name)
+    return state.point
+
 # ( ... distance_to_path, pixel_to_world, world_to_pixel 保持不變 ... )
 def distance_to_path(current_pos, path):
     """回傳 agent 到當前路徑上最近點的距離"""
@@ -1822,6 +1909,54 @@ if __name__ == "__main__":
     found = env.sim.pathfinder.find_path(path)
     print("[DEBUG] path found:", found, " length:", path.geodesic_distance if found else "N/A")
 
+    # 如果不在同一連通區域，讓用戶手動選擇終點
+    while not found:
+        print("[WARN] ⚠️ 目標點與起點不在同一連通區域（可能不同樓層或被牆阻隔）")
+        print("[INFO] 請在地圖上點選一個與起點連通的終點...")
+        
+        # 讓用戶選擇新的終點
+        new_goal_px = select_goal_connected(MAP_PATH, start_px, goal_px)
+        
+        # 如果用戶取消選擇（按 ESC），則退出程式
+        if new_goal_px is None:
+            raise RuntimeError("用戶取消選擇終點，程式結束")
+        
+        new_goal_world = pixel_to_world(new_goal_px[0], new_goal_px[1], w, h, bounds)
+        
+        # 檢查新選擇的終點是否可達
+        new_goal_pos_3d = np.array([new_goal_world[0], 0.0, new_goal_world[1]], dtype=np.float32)
+        new_goal_snapped = env.sim.pathfinder.snap_point(new_goal_pos_3d)
+        if not env.sim.pathfinder.is_navigable(new_goal_snapped):
+            print("[WARN] 選擇的終點不可達，尋找最近的可達點...")
+            new_goal_safe = find_nearest_safe_world_point(
+                env.sim, new_goal_world[0], new_goal_world[1], 
+                SAFE_CLEARANCE_M, rmax=2.0
+            )
+            if new_goal_safe:
+                new_goal_world = new_goal_safe
+                # 更新像素座標（用於後續顯示）
+                new_goal_px = world_to_pixel(new_goal_world[0], new_goal_world[1], w, h, bounds)
+                print(f"[INFO] 終點已修正為: {new_goal_world}")
+            else:
+                print("[WARN] 無法找到可達點，請重新選擇...")
+                continue
+        
+        # 重新檢查連通性
+        path.requested_start = np.array([start_world[0], 0.0, start_world[1]], np.float32)
+        path.requested_end = np.array([new_goal_world[0], 0.0, new_goal_world[1]], np.float32)
+        found = env.sim.pathfinder.find_path(path)
+        
+        if found:
+            print("[INFO] ✅ 找到連通路徑！")
+            goal_world = new_goal_world
+            goal_px = new_goal_px
+            # 注意：original_goal_world 保持不變，用於 target_mask
+            break
+        else:
+            print("[WARN] 選擇的終點仍與起點不在同一連通區域，請重新選擇...")
+            print(f"[DEBUG] 新終點: {new_goal_world}, 可達: {env.sim.pathfinder.is_navigable(new_goal_snapped)}")
+
+    # 現在 goal_world 已經確定與 start_world 在同一連通區域
     path_world = rrt.plan(start_world, goal_world, goal_thresh_m=GOAL_THRESH_M)
     if path_world is None or len(path_world) < 2:
         raise RuntimeError("❌ RRT 規劃失敗（在當前 clearance 與迭代上限下）。請放寬 SAFE_CLEARANCE_M 或調整 goal。")
@@ -1873,17 +2008,21 @@ if __name__ == "__main__":
         print(f"[CHECK] cos(angle to next waypoint) = {cosang:.3f}")
 
     # === 找到目標物件 ID（只匹配選定的物件實例） ===
-    target_object_id, target_object_center = find_target_object_id(env, goal_world, target_class)
+    # 使用原始的 goal_world 來找物件實例（用於 target_mask）
+    # 這樣即使目標點被修正為連通點，target_mask 仍然可以找到原始的物件
+    target_object_id, target_object_center = find_target_object_id(env, original_goal_world, target_class)
     if target_object_id is not None and target_object_center is not None:
         print(f"[INFO] Using specific object mask for object ID: {target_object_id}")
         target_mask_func = create_target_mask_func(target_object_id)
+        # 使用物件中心作為 face_goal 的目標
+        target_goal_world = target_object_center
     else:
         print("[WARN] Could not find target object ID, falling back to category-based mask")
         target_mask_func = target_mask  # 使用原本的函數（匹配所有相同類別的物件）
+        # 使用原始的 goal_world 作為 face_goal 的目標
+        target_goal_world = original_goal_world
     
-    # 使用原始的 goal_world 作為 face_goal 的目標（不管是否找到物件或是否修正過）
-    target_goal_world = original_goal_world
-    print(f"[INFO] face_goal 將朝向原始目標: {target_goal_world}")
+    print(f"[INFO] face_goal 將朝向目標: {target_goal_world}")
 
     # === 錄影器設定 ===
     fourcc = cv2.VideoWriter_fourcc(*'mp4v')

@@ -1347,7 +1347,7 @@ def rrt_star_planning(map_img, start, goal,MIN_SAFE_DIST, SAFE_WEIGHT=10000.0):
     raw_path = extract_path(best_goal_node)
     # 啟用平滑化
     # raw_path = smooth_path(map_img, raw_path, iterations=SMOOTH_ITER)
-    raw_path = smooth_path_chaikin(map_img, raw_path, iterations=3)
+    # raw_path = smooth_path_chaikin(map_img, raw_path, iterations=3)
 
     return raw_path, nodes
 
