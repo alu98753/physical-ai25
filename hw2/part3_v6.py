@@ -1722,6 +1722,7 @@ if __name__ == "__main__":
     # 像素→世界（(x,z)）
     start_world = pixel_to_world(start_px[0], start_px[1], w, h, bounds)
     goal_world  = pixel_to_world(goal_px[0],  goal_px[1],  w, h, bounds)
+    original_goal_world = goal_world  # 保存原始的 goal_world（在修正之前，用於 face_goal）
 
     # === 啟動 Habitat 環境 ===
     sim_settings = {
@@ -1876,13 +1877,13 @@ if __name__ == "__main__":
     if target_object_id is not None and target_object_center is not None:
         print(f"[INFO] Using specific object mask for object ID: {target_object_id}")
         target_mask_func = create_target_mask_func(target_object_id)
-        # 使用目標物件的實際中心作為 face_goal 的目標
-        target_goal_world = target_object_center
     else:
         print("[WARN] Could not find target object ID, falling back to category-based mask")
         target_mask_func = target_mask  # 使用原本的函數（匹配所有相同類別的物件）
-        # 使用原始目標世界座標
-        target_goal_world = goal_world
+    
+    # 使用原始的 goal_world 作為 face_goal 的目標（不管是否找到物件或是否修正過）
+    target_goal_world = original_goal_world
+    print(f"[INFO] face_goal 將朝向原始目標: {target_goal_world}")
 
     # === 錄影器設定 ===
     fourcc = cv2.VideoWriter_fourcc(*'mp4v')
