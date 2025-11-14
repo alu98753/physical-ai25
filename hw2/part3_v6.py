@@ -237,20 +237,36 @@ def create_target_mask_func(target_object_id):
         return mask
     return target_mask_specific
 
+# 全局計數器用於控制顯示間隔
+_display_frame_counter = 0
 
-def navigateAndSee(env_instance, action, target_mask_func, video_writer=None):
+def navigateAndSee(env_instance, action, target_mask_func, video_writer=None, display_interval=1):
     """
     執行一步、即時顯示觀測，並返回觀測值。
+    
+    Args:
+        display_interval: 每隔多少幀更新一次顯示（1=每幀都顯示，2=每2幀顯示一次，以此類推）
     """
+    global _display_frame_counter
     observations = env_instance.step(action)
 
     # 準備合成顯示 (使用 overlay_mask 函數)
     rgb_img = observations["rgb"]
     mask = target_mask_func(observations) # 呼叫 target_mask
     vis_img = overlay_mask(rgb_img, mask) # 合成遮罩
-    cv2.imshow("Navigation (Overlay)", transform_rgb_bgr(vis_img))
-    # cv2.imshow("Depth (Debug)", transform_depth(observations["depth"]))
-    # cv2.imshow("Semantic (Debug)", transform_rgb_bgr(observations["semantic"]))
+    
+    # 增加計數器
+    _display_frame_counter += 1
+    
+    # 只在達到間隔時顯示
+    if _display_frame_counter % display_interval == 0:
+        cv2.imshow("Navigation (Overlay)", transform_rgb_bgr(vis_img))
+        # cv2.imshow("Depth (Debug)", transform_depth(observations["depth"]))
+        # cv2.imshow("Semantic (Debug)", transform_rgb_bgr(observations["semantic"]))
+        # 刷新視窗
+        key = cv2.waitKey(1) & 0xFF
+        if key == ord('q'): # 允許按 'q' 提早結束
+            raise KeyboardInterrupt("User pressed 'q' to quit.")
 
     # 顯示攝影機姿態 (來自您的程式碼)
     # agent_state = env_instance.agent.get_state()
@@ -258,14 +274,10 @@ def navigateAndSee(env_instance, action, target_mask_func, video_writer=None):
     # print("camera pose: x y z rw rx ry rz")
     # print(sensor_state.position[0],...) # (建議註解掉, 否則 log 會爆炸)
 
+    # 視頻始終每幀都錄製（不管顯示間隔）
     if video_writer is not None:
         frame_resized = cv2.resize(transform_rgb_bgr(vis_img), (512, 512))
         video_writer.write(frame_resized)
-
-    # 5. 刷新視窗 (!!!! 關鍵中的關鍵 !!!!)沒有這行, 圖片不會更新
-    key = cv2.waitKey(1) & 0xFF
-    if key == ord('q'): # 允許按 'q' 提早結束
-        raise KeyboardInterrupt("User pressed 'q' to quit.")
 
     return observations
 
@@ -407,7 +419,7 @@ def overlay_mask(rgb, mask, color=(255, 0, 0), alpha=0.15):
     dst = cv2.addWeighted(color_mask, alpha, rgb, 1 - alpha, 0)
     return dst
 
-def face_goal(video_writer, env, goal_world, target_mask, FPS=120, TURN_ANGLE=1):
+def face_goal(video_writer, env, goal_world, target_mask, FPS=120, TURN_ANGLE=1, fast_mode=False, display_interval=1):
     """
     抵達目標後, 旋轉朝向目標並結束錄影。
     使用類似 main.py 的 while 循環進行精確轉向。
@@ -415,6 +427,8 @@ def face_goal(video_writer, env, goal_world, target_mask, FPS=120, TURN_ANGLE=1)
     
     Args:
         goal_world: 目標的世界座標 (x, z) tuple
+        fast_mode: 如果為 True，減少結尾動畫和等待時間
+        display_interval: 每隔多少幀更新一次顯示
     """
     pos = env.agent.get_state().position.copy()
     print(f"[SUCCESS] Reached goal ✅ ({pos[0]:.2f}, {pos[2]:.2f})")
@@ -432,7 +446,7 @@ def face_goal(video_writer, env, goal_world, target_mask, FPS=120, TURN_ANGLE=1)
     iter_count = 0
     while abs(yaw_diff) > math.radians(0.5) and iter_count < 20:  # 持續轉向直到角度差 < 0.5 度
         turn_action = "turn_left" if yaw_diff < 0 else "turn_right"
-        obs = navigateAndSee(env, turn_action, target_mask, video_writer)
+        obs = navigateAndSee(env, turn_action, target_mask, video_writer, display_interval=display_interval)
         
         # 重新計算角度
         q = env.agent.get_state().rotation
@@ -447,7 +461,7 @@ def face_goal(video_writer, env, goal_world, target_mask, FPS=120, TURN_ANGLE=1)
     
     # 確保有最後一次觀測
     if iter_count == 0:
-        obs = navigateAndSee(env, "turn_left", target_mask, video_writer)
+        obs = navigateAndSee(env, "turn_left", target_mask, video_writer, display_interval=display_interval)
 
     # ( ... 結尾動畫 ... )
     rgb = obs["rgb"].copy()
@@ -455,14 +469,27 @@ def face_goal(video_writer, env, goal_world, target_mask, FPS=120, TURN_ANGLE=1)
     vis = overlay_mask(rgb, mask)
     vis = end_anime(vis)
     vis_bgr = transform_rgb_bgr(vis)
+    
+    # 結尾動畫始終顯示（不管 fast_mode）
     cv2.imshow("Navigation (Overlay)", vis_bgr)
+    
     if video_writer is not None:
-        # 寫入約 3 秒動畫（FPS x 3 幀）
-        for _ in range(int(FPS * 3)):
+        # 快速模式下減少結尾動畫幀數
+        if fast_mode:
+            end_frames = int(FPS * 0.5)  # 0.5 秒
+        else:
+            end_frames = int(FPS * 3)  # 3 秒
+        
+        for _ in range(end_frames):
             video_writer.write(cv2.resize(vis_bgr, (512, 512)))
 
     print(f"[END] Navigation finished with facing target. Displaying final frame...")
-    cv2.waitKey(3000)
+    
+    # 結尾動畫始終等待足夠時間讓用戶看到（快速模式下也等待 3 秒）
+    if not fast_mode:
+        cv2.waitKey(3000)  # 正常模式等待 3 秒
+    else:
+        cv2.waitKey(3000)  # 快速模式等待 3 秒（確保能看到文字）
 
 def end_anime(rgb):
     text = "Reached Goal"
@@ -771,13 +798,19 @@ def navigate_simple_turn_move(
     video_writer=None,    # 錄影器
     dist_tol=0.40,        # 抵達航點的距離閾值（米）
     yaw_tol_deg=4.0,      # 對準的角度容忍度（度）
-    max_actions=5000      # 最大動作數
+    max_actions=5000,     # 最大動作數
+    fast_mode=False,       # 快速模式：減少結尾動畫和等待時間
+    display_interval=5     # 每隔多少幀更新一次顯示（5=每5幀顯示一次）
 ):
     """
     簡單的 Turn-then-Move 導航策略，逐個航點導航。
     類似 main.py 的 navigate_with_world_coords，但適配 part3_v6.py 的環境。
     """
+    global _display_frame_counter
     assert len(world_path) >= 2, "world_path 至少要有 2 個點"
+    
+    # 重置顯示計數器
+    _display_frame_counter = 0
     
     # 使用傳入的目標世界座標（用於最終抵達檢查）
     goalx, goalz = goal_world[0], goal_world[1]
@@ -830,7 +863,7 @@ def navigate_simple_turn_move(
                 iter_count = 0
                 while abs(dyaw) > yaw_tol and iter_count < 20:  # 最多轉 20 次
                     action_to_take = "turn_left" if dyaw > 0 else "turn_right"
-                    obs = navigateAndSee(env, action_to_take, target_mask_func, video_writer)
+                    obs = navigateAndSee(env, action_to_take, target_mask_func, video_writer, display_interval=display_interval)
                     actions += 1
                     
                     # 重新計算角度
@@ -846,7 +879,7 @@ def navigate_simple_turn_move(
                         print(f"[ALIGN] iter={iter_count}, dyaw={math.degrees(dyaw):.1f}°")
                 
                 print("Final waypoint reached and aligned.")
-                face_goal(video_writer, env, goal_world, target_mask_func)
+                face_goal(video_writer, env, goal_world, target_mask_func, fast_mode=fast_mode, display_interval=1)
                 print("[DONE] Arrived goal.")
                 return
             
@@ -889,7 +922,7 @@ def navigate_simple_turn_move(
         
         # 執行動作
         if action_to_take:
-            obs = navigateAndSee(env, action_to_take, target_mask_func, video_writer)
+            obs = navigateAndSee(env, action_to_take, target_mask_func, video_writer, display_interval=display_interval)
             actions += 1
             
             # 碰撞檢測：檢查是否卡住
@@ -897,8 +930,8 @@ def navigate_simple_turn_move(
                 new_pos = env.agent.get_state().position
                 if np.linalg.norm(new_pos - pos) < 1e-4:
                     print("[WARN] No progress, possibly stuck. Trying to turn...")
-                    obs = navigateAndSee(env, "turn_right", target_mask_func, video_writer)
-                    obs = navigateAndSee(env, "turn_right", target_mask_func, video_writer)
+                    obs = navigateAndSee(env, "turn_right", target_mask_func, video_writer, display_interval=display_interval)
+                    obs = navigateAndSee(env, "turn_right", target_mask_func, video_writer, display_interval=display_interval)
                     actions += 2
     
     if actions >= max_actions:
@@ -1709,7 +1742,7 @@ if __name__ == "__main__":
     loaded = env.sim.pathfinder.load_nav_mesh(navmesh_path)
     print("[NAVMESH] loaded:", loaded)
     # === 世界座標 RRT 規劃（帶安全距離） ===
-    SAFE_CLEARANCE_M = 0.1   # 你想離牆/家具的距離（m）
+    SAFE_CLEARANCE_M = 0.05   # 你想離牆/家具的距離（m）
     RRT_STEP_M       = 0.05   # RRT 延伸步長（m）
     GOAL_BIAS        = 0.20   # 目標偏置機率
     GOAL_THRESH_M    = 0.50   # 視為到達 goal 的半徑（m）
@@ -1866,7 +1899,9 @@ if __name__ == "__main__":
         video_writer=video_writer,
         dist_tol=0.40,                     # 抵達航點的距離閾值（米）
         yaw_tol_deg=4.0,                   # 對準的角度容忍度（度）
-        max_actions=MAX_ACTIONS
+        max_actions=MAX_ACTIONS,
+        fast_mode=True,                    # 啟用快速模式：減少結尾動畫和等待時間
+        display_interval=20                 # 每5幀顯示一次（可以調整，數字越大越快速）
     )
 
     # 收尾
