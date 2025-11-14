@@ -941,7 +941,7 @@ def navigate_simple_turn_move(
             desired_yaw = get_desired_yaw(current_pos_xz, (goalx, goalz))
             dyaw = wrap_to_pi(desired_yaw - current_yaw)
             
-            print(f"[nav] pos=({pos[0]:.2f},{pos[2]:.2f}) -> final_goal=({goalx:.2f},{goalz:.2f}). dist={final_dist:.2f}, dyaw={math.degrees(dyaw):.1f}°")
+            # print(f"[nav] pos=({pos[0]:.2f},{pos[2]:.2f}) -> final_goal=({goalx:.2f},{goalz:.2f}). dist={final_dist:.2f}, dyaw={math.degrees(dyaw):.1f}°")
             
             # 如果已經到達目標距離，進行精確轉向（類似 main.py 的做法）
             if final_dist <= dist_tol:
@@ -1843,8 +1843,8 @@ if __name__ == "__main__":
         clearance_m=SAFE_CLEARANCE_M,
         node_retry=200,
         # RRT* 參數（預設啟用）
-        min_safe_dist=0.1,              # 最小安全距離（米）
-        safe_weight=1000.0,             # 安全懲罰權重
+        min_safe_dist=0.02,              # 最小安全距離（米）
+        safe_weight=100.0,             # 安全懲罰權重
         goal_safety_exempt_dist=1.0,    # 接近目標時放寬安全距離（米）
         use_rrt_star=True               # 啟用 RRT* 機制
     )
@@ -2014,8 +2014,27 @@ if __name__ == "__main__":
     if target_object_id is not None and target_object_center is not None:
         print(f"[INFO] Using specific object mask for object ID: {target_object_id}")
         target_mask_func = create_target_mask_func(target_object_id)
-        # 使用物件中心作為 face_goal 的目標
-        target_goal_world = target_object_center
+        
+        # 檢查物件中心是否可達，如果不可達則移到最近的可達點
+        center_3d = np.array([target_object_center[0], 0.0, target_object_center[1]], dtype=np.float32)
+        if not env.sim.pathfinder.is_navigable(center_3d):
+            print(f"[INFO] 目標物件中心不可達，尋找最近的可達點...")
+            # 使用較小的搜索半徑（0.5m），確保不會移太遠
+            safe_center = find_nearest_safe_world_point(
+                env.sim, target_object_center[0], target_object_center[1], 
+                SAFE_CLEARANCE_M, rmax=0.5
+            )
+            if safe_center:
+                dist = math.hypot(safe_center[0] - target_object_center[0], 
+                                 safe_center[1] - target_object_center[1])
+                print(f"[INFO] 目標點已從物件內部移到可達點，距離: {dist:.2f}m")
+                target_goal_world = safe_center
+            else:
+                print(f"[WARN] 無法找到可達點，使用原始中心點（可能導致導航失敗）")
+                target_goal_world = target_object_center
+        else:
+            # 中心點可達，直接使用
+            target_goal_world = target_object_center
     else:
         print("[WARN] Could not find target object ID, falling back to category-based mask")
         target_mask_func = target_mask  # 使用原本的函數（匹配所有相同類別的物件）
@@ -2037,7 +2056,7 @@ if __name__ == "__main__":
         target_mask_func=target_mask_func,  # 使用特定的物件遮罩函式
         goal_world=target_goal_world,      # 使用目標物件的實際世界座標
         video_writer=video_writer,
-        dist_tol=0.40,                     # 抵達航點的距離閾值（米）
+        dist_tol=0.550,                     # 抵達航點的距離閾值（米）
         yaw_tol_deg=4.0,                   # 對準的角度容忍度（度）
         max_actions=MAX_ACTIONS,
         fast_mode=True,                    # 啟用快速模式：減少結尾動畫和等待時間

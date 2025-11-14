@@ -400,6 +400,7 @@ def find_all_object_instances(map_path, color_map, target_class,
     
     # (1) 定義一個 "核" (Kernel) 決定了要合併多近的物體
     #     根據物體類別調整 kernel 大小，避免跨房間合併
+    #     小物件使用小 kernel，避免兩個接近的實例被合併
     KERNEL_SIZES = {
         'sofa': (150, 150),      # 較小的 kernel，避免跨房間
         'stair': (200, 200),     # 樓梯可能較長
@@ -407,8 +408,16 @@ def find_all_object_instances(map_path, color_map, target_class,
         'bed': (200, 200),       # 床可能較大
         'window': (300, 300),    # 窗戶可以較大
         'door': (150, 150),      # 門通常較小
+        'cushion': (20, 20),     # cushion 通常很小且可能很接近，使用小 kernel
+        'pillow': (50, 50),      # pillow 也很小
+        'cup': (30, 30),         # cup 非常小
+        'bottle': (30, 30),      # bottle 也很小
+        'cooktop': (80, 80),     # cooktop 中等大小
+        'rack': (80, 80),        # rack 中等大小
+        'desk': (100, 100),      # desk 中等大小
     }
-    merge_kernel_size = KERNEL_SIZES.get(target_class, (300, 300))
+    # 降低預設值，避免小物件被過度合併（從 300 改為 100）
+    merge_kernel_size = KERNEL_SIZES.get(target_class, (100, 100))
     kernel = cv2.getStructuringElement(cv2.MORPH_RECT, merge_kernel_size)
     
     # (2) 執行閉運算 (Dilation -> Erosion)
