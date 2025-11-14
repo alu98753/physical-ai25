@@ -1551,9 +1551,13 @@ class RRTWorld:
         s_safe = find_nearest_safe_world_point(self.sim, float(s3[0]), float(s3[2]), self.clearance_m)
         g_safe = find_nearest_safe_world_point(self.sim, float(g3[0]), float(g3[2]), self.clearance_m)
         if s_safe is None:
-            raise RuntimeError("Start 附近找不到滿足安全距的可走點（可調小 clearance 或換起點）")
+            # 如果找不到滿足安全距離的點，至少使用 snap 後的點（可達）
+            print("[WARN] Start 附近找不到滿足安全距的可走點，使用 snap 後的點（可能在邊邊角角）")
+            s_safe = (float(s3[0]), float(s3[2]))
         if g_safe is None:
-            raise RuntimeError("Goal 附近找不到滿足安全距的可走點（可調小 clearance 或換目標）")
+            # 如果找不到滿足安全距離的點，至少使用 snap 後的點（可達）
+            print("[WARN] Goal 附近找不到滿足安全距的可走點，使用 snap 後的點（可能在邊邊角角）")
+            g_safe = (float(g3[0]), float(g3[2]))
         sx, sz = s_safe; gx, gz = g_safe
 
         # 連通性快檢：不同 island 直接回報（避免白跑 RRT）
@@ -1572,7 +1576,10 @@ class RRTWorld:
         best_goal_node = None
         best_goal_cost = float('inf')
         consecutive_no_improvement = 0  # 連續無改進次數
-        max_no_improvement = 5  # 最大無改進次數（早期終止）
+        # 如果起點或終點在邊邊角角（使用 snap 後的點），增加容忍度
+        is_start_corner = (s_safe[0] == float(s3[0]) and s_safe[1] == float(s3[2]))
+        is_goal_corner = (g_safe[0] == float(g3[0]) and g_safe[1] == float(g3[2]))
+        max_no_improvement = 200 if (is_start_corner or is_goal_corner) else 5  # 最大無改進次數（早期終止）
 
         for it in range(self.max_iter):
             # 早期終止：如果連續很多次沒有改進，提前結束（只在找到目標後才檢查）
@@ -1607,11 +1614,13 @@ class RRTWorld:
                         continue  # 跳過太靠近障礙物的點
 
             # 邊檢查：帶 clearance 的掃掠測試
-            if edge_collision_free_with_clearance(self.sim, qnear, qnew, self.clearance_m, step_m=self.step_m*0.5):
+            # 如果起點或終點在邊邊角角，使用較小的 clearance
+            effective_clearance = self.clearance_m * 0.1 if (is_start_corner or is_goal_corner) else self.clearance_m
+            if edge_collision_free_with_clearance(self.sim, qnear, qnew, effective_clearance, step_m=self.step_m*0.5):
                 # snap 一下更穩
                 qnew = snap(self.sim, *qnew)
-                # 新節點也要有 clearance
-                if not point_has_clearance(self.sim, qnew[0], qnew[1], self.clearance_m, dirs=4):
+                # 新節點也要有 clearance（在邊邊角角時放寬）
+                if not point_has_clearance(self.sim, qnew[0], qnew[1], effective_clearance, dirs=4):
                     continue
                 
                 new_node_idx = len(self.nodes)
@@ -1630,8 +1639,8 @@ class RRTWorld:
                     neighbors = self._get_neighbors(new_node_idx, radius=2.0 * self.step_m)
                     for nb_idx in neighbors:
                         nb_xy = self.nodes[nb_idx]
-                        # 檢查邊是否無碰撞
-                        if edge_collision_free_with_clearance(self.sim, nb_xy, qnew, self.clearance_m, step_m=self.step_m*0.5):
+                        # 檢查邊是否無碰撞（在邊邊角角時使用較小的 clearance）
+                        if edge_collision_free_with_clearance(self.sim, nb_xy, qnew, effective_clearance, step_m=self.step_m*0.5):
                             # 使用緩存的距離
                             cand_cost = self.costs[nb_idx] + self._calculate_edge_cost(nb_xy, qnew, (gx, gz), cached_dist=new_node_d_safe)
                             if cand_cost < best_cost:
@@ -1649,8 +1658,8 @@ class RRTWorld:
                         if nb_idx == best_parent_idx or rewire_count >= max_rewire:
                             continue
                         nb_xy = self.nodes[nb_idx]
-                        # 檢查是否可以通過新節點優化鄰居的路徑
-                        if edge_collision_free_with_clearance(self.sim, qnew, nb_xy, self.clearance_m, step_m=self.step_m*0.5):
+                        # 檢查是否可以通過新節點優化鄰居的路徑（在邊邊角角時使用較小的 clearance）
+                        if edge_collision_free_with_clearance(self.sim, qnew, nb_xy, effective_clearance, step_m=self.step_m*0.5):
                             new_cost = best_cost + self._calculate_edge_cost(qnew, nb_xy, (gx, gz))
                             if new_cost < self.costs[nb_idx]:
                                 self.parent[nb_idx] = new_node_idx
@@ -1663,8 +1672,8 @@ class RRTWorld:
 
                 # 是否到目標
                 if math.hypot(qnew[0]-gx, qnew[1]-gz) <= goal_thresh_m:
-                    # 追加一段到 goal（如需）
-                    if edge_collision_free_with_clearance(self.sim, qnew, (gx, gz), self.clearance_m, step_m=self.step_m*0.5):
+                    # 追加一段到 goal（如需，在邊邊角角時使用較小的 clearance）
+                    if edge_collision_free_with_clearance(self.sim, qnew, (gx, gz), effective_clearance, step_m=self.step_m*0.5):
                         goal_node_idx = len(self.nodes)
                         self.nodes.append((gx, gz))
                         
@@ -1830,7 +1839,7 @@ if __name__ == "__main__":
     loaded = env.sim.pathfinder.load_nav_mesh(navmesh_path)
     print("[NAVMESH] loaded:", loaded)
     # === 世界座標 RRT 規劃（帶安全距離） ===
-    SAFE_CLEARANCE_M = 0.05   # 你想離牆/家具的距離（m）
+    SAFE_CLEARANCE_M = 0.1   # 你想離牆/家具的距離（m）
     RRT_STEP_M       = 0.05   # RRT 延伸步長（m）
     GOAL_BIAS        = 0.20   # 目標偏置機率
     GOAL_THRESH_M    = 0.7   # 視為到達 goal 的半徑（m）
@@ -1872,6 +1881,10 @@ if __name__ == "__main__":
                                                     SAFE_CLEARANCE_M, rmax=0.5)  # 小範圍搜索
         if start_safe:
             start_world = start_safe
+        else:
+            # 如果找不到滿足安全距離的點（可能在邊邊角角），至少使用 snap 後的點（可達）
+            print("[WARN] 起點附近找不到滿足安全距離的點，使用 snap 後的點（可能在邊邊角角）")
+            start_world = (float(start_snapped[0]), float(start_snapped[2]))
     
     # 修正終點
     goal_pos_3d = np.array([goal_world[0], 0.0, goal_world[1]], dtype=np.float32)
@@ -1895,6 +1908,10 @@ if __name__ == "__main__":
                                                     SAFE_CLEARANCE_M, rmax=0.5)  # 小範圍搜索
         if goal_safe:
             goal_world = goal_safe
+        else:
+            # 如果找不到滿足安全距離的點（可能在邊邊角角），至少使用 snap 後的點（可達）
+            print("[WARN] 終點附近找不到滿足安全距離的點，使用 snap 後的點（可能在邊邊角角）")
+            goal_world = (float(goal_snapped[0]), float(goal_snapped[2]))
     
     # 驗證修正後的點
     print("[DEBUG] start navigable:", env.sim.pathfinder.is_navigable(
