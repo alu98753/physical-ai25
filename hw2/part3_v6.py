@@ -445,7 +445,7 @@ def face_goal(video_writer, env, goal_world, target_mask, FPS=120, TURN_ANGLE=1,
     # 使用 while 循環持續轉向直到對準（類似 main.py 的做法）
     iter_count = 0
     while abs(yaw_diff) > math.radians(0.5) and iter_count < 20:  # 持續轉向直到角度差 < 0.5 度
-        turn_action = "turn_left" if yaw_diff < 0 else "turn_right"
+        turn_action = "turn_left" if yaw_diff > 0 else "turn_right"
         obs = navigateAndSee(env, turn_action, target_mask, video_writer, display_interval=display_interval)
         
         # 重新計算角度
@@ -1746,7 +1746,7 @@ if __name__ == "__main__":
     SAFE_CLEARANCE_M = 0.05   # 你想離牆/家具的距離（m）
     RRT_STEP_M       = 0.05   # RRT 延伸步長（m）
     GOAL_BIAS        = 0.20   # 目標偏置機率
-    GOAL_THRESH_M    = 0.50   # 視為到達 goal 的半徑（m）
+    GOAL_THRESH_M    = 0.7   # 視為到達 goal 的半徑（m）
 
     rrt = RRTWorld(
         env.sim,
@@ -1792,7 +1792,7 @@ if __name__ == "__main__":
     if not env.sim.pathfinder.is_navigable(goal_snapped):
         print("[WARN] 終點不可達，尋找最近的可達點...")
         goal_safe = find_nearest_safe_world_point(env.sim, goal_world[0], goal_world[1], 
-                                                   SAFE_CLEARANCE_M, rmax=2.0)  # 擴大搜索半徑
+                                                SAFE_CLEARANCE_M, rmax=2.0)  # 擴大搜索半徑
         if goal_safe:
             # 檢查修正後的點是否距離原始點太遠
             dist = math.hypot(goal_safe[0] - goal_world[0], goal_safe[1] - goal_world[1])

@@ -35,25 +35,25 @@ class Projection(object):
 
         # 1. 根據 HW1 spec 初始化相機參數
         
-        # [cite_start]內參 (Intrinsics) - 兩個相機共用 [cite: 36, 37, 38]
+        # 內參 (Intrinsics) - 兩個相機共用
         W, H = self.width, self.height
         cx, cy = W / 2, H / 2
         # 使用傳入的 fov 參數計算焦距
         f = (W / 2) / np.tan(np.deg2rad(fov / 2))
         # f = (math.sqrt(W**2 + H**2) / 2) / np.tan(np.deg2rad(fov / 2))
         K = np.array([[f, 0, cx],
-                      [0, f, cy],
-                      [0, 0,  1]], dtype=np.float32)
+                    [0, f, cy],
+                    [0, 0,  1]], dtype=np.float32)
         K_inv = np.linalg.inv(K)
 
-        # 外參 (Extrinsics) - 根據 spec 硬編碼
-        # [cite_start]前視相機 Camera1 [cite: 27]
+        # 外參 (Extrinsics) - 根據 spec 
+        # 前視相機 Camera1
         C_front = np.array([0, 1, 0], dtype=np.float32)
-        # [cite_start]R_front 是單位矩陣, 因為姿態是 (0,0,0) [cite: 27]
+        # R_front 是單位矩陣, 因為姿態是 (0,0,0)
 
-        # [cite_start]BEV 相機 Camera2 [cite: 28]
+        # BEV 相機 Camera2
         C_bev = np.array([0, 2.5, 0], dtype=np.float32)
-        # [cite_start]姿態是 (-pi/2, 0, 0), 也就是繞X軸旋轉-90度 [cite: 28]
+        # 姿態是 (-pi/2, 0, 0), 也就是繞X軸旋轉-90度
         # 這裡我們不使用傳入的 theta, 而是用 spec 中指定的 pitch
         pitch = -np.pi / 2
         R_bev = np.array([[1, 0, 0],
