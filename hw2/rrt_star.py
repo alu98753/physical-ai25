@@ -375,11 +375,15 @@ def find_all_object_instances(map_path, color_map, target_class):
     # 1. 取得目標顏色 (BGR)
     bgr_color = tuple(reversed(color_map[target_class]))
     
-    # 2. 建立該顏色的二進位遮罩 地圖上所有 'window' 像素都會是 255
-    original_mask = cv2.inRange(img, bgr_color, bgr_color)
+    # 2. 建立該顏色的二進位遮罩（使用容差匹配來處理顏色偏差）
+    #    地圖壓縮/格式轉換可能導致顏色偏差，使用容差匹配更可靠
+    COLOR_TOLERANCE = 5  # 允許每個通道有 ±5 的偏差，與主程式一致
+    lower_bound = np.array([max(0, c - COLOR_TOLERANCE) for c in bgr_color], dtype=np.uint8)
+    upper_bound = np.array([min(255, c + COLOR_TOLERANCE) for c in bgr_color], dtype=np.uint8)
+    original_mask = cv2.inRange(img, lower_bound, upper_bound)
     
     if cv2.countNonZero(original_mask) == 0:
-        print(f"⚠️ 找不到目標類別 '{target_class}' 的任何像素。")
+        print(f"⚠️ 找不到目標類別 '{target_class}' 的任何像素（即使使用容差匹配）。")
         return [], None
 
     # ==========================================================

@@ -158,13 +158,13 @@ def target_mask(obs):
 
 def find_target_object_id(env, goal_world, target_class):
     """
-    從目標世界座標找到最近的物件，並返回其物件 ID。
+    從目標世界座標找到最近的物件，並返回其物件 ID 和世界座標中心。
     這樣可以只匹配特定的物件實例，而不是所有相同語意類別的物件。
     """
     scene = env.sim.semantic_scene
     if not scene or not scene.objects:
         print("[WARN] Semantic scene or objects not available")
-        return None
+        return None, None
     
     # 獲取目標類別的語意 ID
     target_category_id = id_map[target_class.lower()] % 40
@@ -203,14 +203,14 @@ def find_target_object_id(env, goal_world, target_class):
                 
                 if obj_center:
                     dist = math.hypot(obj_center[0] - goal_world[0], obj_center[1] - goal_world[1])
-                    candidate_objects.append((obj, dist))
+                    candidate_objects.append((obj, dist, obj_center))
     
     if not candidate_objects:
         print(f"[WARN] No objects found for target class '{target_class}' near goal position")
-        return None
+        return None, None
     
     # 找到最近的物件
-    closest_obj, min_dist = min(candidate_objects, key=lambda x: x[1])
+    closest_obj, min_dist, obj_center_world = min(candidate_objects, key=lambda x: x[1])
     
     # 獲取物件 ID
     obj_id = closest_obj.id
@@ -219,10 +219,11 @@ def find_target_object_id(env, goal_world, target_class):
             obj_id = int(obj_id.lstrip('_'))
         except ValueError:
             print(f"[WARN] Could not convert object ID '{obj_id}' to int")
-            return None
+            return None, None
     
     print(f"[INFO] Found target object ID: {obj_id} at distance {min_dist:.2f}m from goal")
-    return obj_id
+    print(f"[INFO] Target object center: {obj_center_world}")
+    return obj_id, obj_center_world
 
 def create_target_mask_func(target_object_id):
     """
@@ -406,14 +407,20 @@ def overlay_mask(rgb, mask, color=(255, 0, 0), alpha=0.15):
     dst = cv2.addWeighted(color_mask, alpha, rgb, 1 - alpha, 0)
     return dst
 
-def face_goal(video_writer,env, goal, bounds, w, h, target_mask, FPS=120, TURN_ANGLE=1):
+def face_goal(video_writer, env, goal_world, target_mask, FPS=120, TURN_ANGLE=1):
     """
     抵達目標後, 旋轉朝向目標並結束錄影。
     使用類似 main.py 的 while 循環進行精確轉向。
+    使用目標物件的實際世界座標，而不是從像素座標轉換。
+    
+    Args:
+        goal_world: 目標的世界座標 (x, z) tuple
     """
     pos = env.agent.get_state().position.copy()
     print(f"[SUCCESS] Reached goal ✅ ({pos[0]:.2f}, {pos[2]:.2f})")
-    gx, gz = pixel_to_world(goal[0], goal[1], w, h, bounds)
+    
+    # 使用目標物件的實際世界座標
+    gx, gz = goal_world[0], goal_world[1]
     dx, dz = gx - pos[0], gz - pos[2]
     desired_yaw = math.atan2(-dx, -dz)
     q = env.agent.get_state().rotation
@@ -760,9 +767,7 @@ def navigate_simple_turn_move(
     env,                    # HabitatEnvWrapper
     world_path,            # [(x, z), ...] 世界座標路徑
     target_mask_func,      # target_mask 函數
-    goal_pixel,           # 最終目標像素座標
-    bounds,               # 座標邊界
-    w, h,                 # 地圖寬高
+    goal_world,           # 最終目標世界座標 (x, z)
     video_writer=None,    # 錄影器
     dist_tol=0.40,        # 抵達航點的距離閾值（米）
     yaw_tol_deg=4.0,      # 對準的角度容忍度（度）
@@ -774,8 +779,8 @@ def navigate_simple_turn_move(
     """
     assert len(world_path) >= 2, "world_path 至少要有 2 個點"
     
-    # 計算目標世界座標（用於最終抵達檢查）
-    goalx, goalz = pixel_to_world(goal_pixel[0], goal_pixel[1], w, h, bounds)
+    # 使用傳入的目標世界座標（用於最終抵達檢查）
+    goalx, goalz = goal_world[0], goal_world[1]
     
     # 計算初始狀態
     astate = env.agent.get_state()
@@ -841,7 +846,7 @@ def navigate_simple_turn_move(
                         print(f"[ALIGN] iter={iter_count}, dyaw={math.degrees(dyaw):.1f}°")
                 
                 print("Final waypoint reached and aligned.")
-                face_goal(video_writer, env, goal_pixel, bounds, w, h, target_mask_func)
+                face_goal(video_writer, env, goal_world, target_mask_func)
                 print("[DONE] Arrived goal.")
                 return
             
@@ -1443,14 +1448,33 @@ if __name__ == "__main__":
 
     # 語意表 & 有哪些類別真實出現在地圖
     color_map = load_semantic_table(EXCEL_PATH)
+    print(f"[INFO] color_map: {color_map.keys()}")
+    
+    
     id_map    = load_semantic_ID_table(EXCEL_PATH)
     unique_colors = np.unique(map_img.reshape(-1, 3), axis=0)
     unique_set    = {tuple(c.tolist()) for c in unique_colors}
+    
+    # 使用容差匹配來處理顏色偏差（地圖壓縮/格式轉換導致的顏色變化）
+    COLOR_TOLERANCE = 5  # 允許每個通道有 ±5 的偏差
     available_classes = []
     for name, rgb in color_map.items():
         bgr = tuple(reversed(rgb))
+        bgr_array = np.array(bgr)
+        
+        # 先嘗試精確匹配
         if bgr in unique_set:
             available_classes.append(name)
+        else:
+            # 如果精確匹配失敗，嘗試容差匹配
+            found = False
+            for unique_color in unique_set:
+                unique_array = np.array(unique_color)
+                diff = np.abs(bgr_array - unique_array)
+                if np.all(diff <= COLOR_TOLERANCE):
+                    available_classes.append(name)
+                    found = True
+                    break
     if not available_classes:
         raise RuntimeError("❌ 地圖上找不到任何語意類別，請確認 map 與 color map 是否一致。")
     print(f"[INFO] 可用的目標類別：{available_classes}")
@@ -1568,13 +1592,17 @@ if __name__ == "__main__":
         print(f"[CHECK] cos(angle to next waypoint) = {cosang:.3f}")
 
     # === 找到目標物件 ID（只匹配選定的物件實例） ===
-    target_object_id = find_target_object_id(env, goal_world, target_class)
-    if target_object_id is not None:
+    target_object_id, target_object_center = find_target_object_id(env, goal_world, target_class)
+    if target_object_id is not None and target_object_center is not None:
         print(f"[INFO] Using specific object mask for object ID: {target_object_id}")
         target_mask_func = create_target_mask_func(target_object_id)
+        # 使用目標物件的實際中心作為 face_goal 的目標
+        target_goal_world = target_object_center
     else:
         print("[WARN] Could not find target object ID, falling back to category-based mask")
         target_mask_func = target_mask  # 使用原本的函數（匹配所有相同類別的物件）
+        # 使用原始目標世界座標
+        target_goal_world = goal_world
 
     # === 錄影器設定 ===
     fourcc = cv2.VideoWriter_fourcc(*'mp4v')
@@ -1587,12 +1615,10 @@ if __name__ == "__main__":
         env,
         world_path=path_world,
         target_mask_func=target_mask_func,  # 使用特定的物件遮罩函式
-        goal_pixel=goal_px,            # face_goal 仍需像素座標
-        bounds=bounds,
-        w=w, h=h,
+        goal_world=target_goal_world,      # 使用目標物件的實際世界座標
         video_writer=video_writer,
-        dist_tol=0.05,                 # 抵達航點的距離閾值（米）
-        yaw_tol_deg=4.0,               # 對準的角度容忍度（度）
+        dist_tol=0.40,                     # 抵達航點的距離閾值（米）
+        yaw_tol_deg=4.0,                   # 對準的角度容忍度（度）
         max_actions=MAX_ACTIONS
     )
 
